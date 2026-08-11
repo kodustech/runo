@@ -245,9 +245,17 @@ runo new my-task        # same CLI, same flow — AWS stays server-side
   devs never touch infra config.
 - `runo agent` over the control plane uses an experimental WebSocket TTY
   tunnel; headless usage (`runo agent claude -- -p …`) works everywhere.
+- **Org policies** (`$RUNO_HOME/policies.yaml` on the server, hot-reloaded —
+  see `server/policies.example.yaml`): instance-type allowlist, max disk,
+  max envs per user, org-wide running ceiling, and an env TTL with automatic
+  destruction (sweeper at startup + every 10min). The recipe in each repo
+  decides the machine for that workload; policies are the platform team's
+  ceilings on what any recipe/user may ask for. Violations fail `runo new`
+  instantly with an actionable message — before anything touches the cloud.
+  `GET /v1/policies` shows the active policy set.
 - v0 is single-process with token auth and JSON state — put TLS/VPN
   (ALB, Caddy, Tailscale) in front before exposing it beyond localhost.
-  Org-level quotas, SSO and a web panel are the next iterations.
+  SSO and a richer panel are the next iterations.
 
 ## Security — accepted v1 limitations (documented on purpose)
 

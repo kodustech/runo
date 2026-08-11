@@ -19,7 +19,8 @@ import { RUNO_HOME } from "../src/config";
 import { RunoError } from "../src/errors";
 import { log } from "../src/log";
 import { Ec2Provider } from "../src/provider/aws";
-import type { ExecOpts, Runtime } from "../src/provider/types";
+import type { CreateSpec, ExecOpts, Runtime } from "../src/provider/types";
+import { enforceCreate, loadPolicies } from "./policies";
 
 const PORT = Number(process.env.RUNO_SERVER_PORT || argValue("--port") || 7777);
 const provider = new Ec2Provider();
@@ -110,6 +111,19 @@ const RPC_ALLOWED = new Set([
 async function handleRpc(user: string, body: any): Promise<Response> {
   const { method, args = [] } = body;
   if (!RPC_ALLOWED.has(method)) return json({ error: { message: `unknown method: ${method}` } }, 400);
+
+  // org policies: enforced at the boundary devs use, before touching the cloud
+  if (method === "create") {
+    const pol = loadPolicies();
+    const spec = args[0] as CreateSpec;
+    const userEnvCount = Object.values(loadEnvs()).filter((e) => e.owner === user).length;
+    let runningTotal = 0;
+    if (pol.max_running_total !== undefined)
+      runningTotal = (await provider.listManaged()).filter(
+        (m) => m.state === "running" || m.state === "pending",
+      ).length;
+    enforceCreate(pol, spec, { user, userEnvCount, runningTotal });
+  }
 
   const result = await (provider as any)[method](...args);
 
@@ -237,6 +251,8 @@ const server = Bun.serve<TtyData, {}>({
         return await handleExec(user, await req.json());
       if (url.pathname === "/v1/upload" && req.method === "POST") return await handleUpload(req, url);
       if (url.pathname === "/v1/download" && req.method === "POST") return await handleDownload(req);
+      if (url.pathname === "/v1/policies" && req.method === "GET")
+        return json({ result: loadPolicies() });
       if (url.pathname === "/v1/envs" && req.method === "GET") {
         const envs = Object.values(loadEnvs());
         if (url.searchParams.get("live") !== "1") return json({ result: envs });
@@ -301,6 +317,35 @@ const server = Bun.serve<TtyData, {}>({
     },
   },
 });
+
+// ---------- TTL sweeper (policy env_ttl_days) ----------
+
+async function sweepTtl(): Promise<void> {
+  let pol;
+  try {
+    pol = loadPolicies();
+  } catch {
+    return; // broken policies.yaml already errors on create; don't crash the sweeper
+  }
+  if (!pol.env_ttl_days) return;
+  const cutoff = Date.now() - pol.env_ttl_days * 86_400_000;
+  for (const e of Object.values(loadEnvs())) {
+    if (new Date(e.createdAt).getTime() >= cutoff) continue;
+    log.warn(
+      `policy TTL (${pol.env_ttl_days}d): destroying ${e.envName} (owner ${e.owner}, created ${e.createdAt})`,
+    );
+    try {
+      await provider.destroy({ id: e.instanceId, ip: null, state: "unknown" });
+      const cur = loadEnvs();
+      delete cur[e.envName];
+      saveEnvs(cur);
+    } catch (err: any) {
+      log.warn(`TTL destroy failed for ${e.envName}: ${err?.message ?? err}`);
+    }
+  }
+}
+setInterval(sweepTtl, 10 * 60_000);
+void sweepTtl();
 
 log.ok(`runo-server listening on :${server.port} (users: ${[...new Set(tokens.values())].join(", ")})`);
 log.dim(`state: ${RUNO_HOME} — put TLS/VPN in front before exposing this beyond localhost`);

@@ -1,0 +1,22 @@
+# runo-server org policies — copy to $RUNO_HOME/policies.yaml (server side).
+# Re-read on every request: edits apply immediately, no restart needed.
+# Every field is optional; absent = unlimited.
+#
+# The recipe in each repo decides the machine for that workload (by PR);
+# these are the platform team's CEILINGS on what any recipe/user may ask for.
+
+# Exact-match allowlist of instance types recipes may request:
+allowed_instance_types: [t3.medium, t3.large, t3.xlarge, t3a.xlarge]
+
+# Maximum root disk a recipe may request:
+max_disk_gb: 150
+
+# Maximum environments a single user may own at once:
+max_envs_per_user: 3
+
+# Org-wide ceiling of RUNNING instances (stopped ones cost only EBS):
+max_running_total: 9
+
+# Auto-destroy environments older than this many days (fractions allowed).
+# The sweeper runs at startup and every 10 minutes.
+env_ttl_days: 7
