@@ -32,6 +32,7 @@ export interface EnvContext {
   slug: string;
   envName: string;
   worktree: string;
+  externalWorktree?: boolean; // worktree owned by an external tool (runo up --here)
   recipe: NormalizedRecipe;
   recipePath: string;
 }
@@ -49,6 +50,27 @@ export function buildContext(repoPath: string, branch: string): EnvContext {
   // covers untracked recipes
   const { recipe, path: recipePath } = loadRecipe(worktree, repoPath);
   return { repoPath, repoName, branch, slug, envName: envNameFor(slug), worktree, recipe, recipePath };
+}
+
+/**
+ * `runo up --here`: the CURRENT working tree is the sync anchor — for tools
+ * that own their worktrees (Orca, plain checkouts). runo never removes it.
+ */
+export function buildContextHere(worktreePath: string, branch: string): EnvContext {
+  const repoName = path.basename(worktreePath);
+  const slug = slugify(branch);
+  const { recipe, path: recipePath } = loadRecipe(worktreePath);
+  return {
+    repoPath: worktreePath,
+    repoName,
+    branch,
+    slug,
+    envName: envNameFor(slug),
+    worktree: worktreePath,
+    externalWorktree: true,
+    recipe,
+    recipePath,
+  };
 }
 
 export function contextFromEnv(env: EnvRecord): EnvContext {

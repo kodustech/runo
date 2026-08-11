@@ -131,6 +131,21 @@ dedicated to the env (exclusive Docker daemon), fixed `container_name`s and
 published ports from the repo **cannot collide by construction** — no DinD, no
 compose overrides.
 
+## Worktree tools (Orca & friends): `runo up --here`
+
+If another tool already owns your worktrees (Orca, `git worktree` by hand),
+skip `runo new` entirely: run `runo up --here` inside the worktree and that
+directory becomes the env's sync anchor — `runo push`/`pull` sync it, and
+`runo destroy` terminates the instance but **never touches the directory**.
+
+Orca post-create hook (one line — every new worktree gets a remote env):
+
+```bash
+# copy untracked requirements first if your recipe needs them, e.g.:
+# cp ~/dev/my-repo/.env .
+runo up --here
+```
+
 ## Two ways to use an agent
 
 1. **Agent ON the VM** (`runo agent claude|codex`) — the brain runs there, in a

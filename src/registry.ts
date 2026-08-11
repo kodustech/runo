@@ -22,6 +22,9 @@ export interface EnvRecord {
   /** true only after the full pipeline (upload+setup+services+health) — the
    * instance state does NOT substitute this: an interrupted up stays false. */
   materialized?: boolean;
+  /** worktree is owned by an external tool (Orca, the user) — runo up --here.
+   * destroy must NOT remove it. */
+  externalWorktree?: boolean;
   publicServices: PublicService[];
   createdAt: string;
   updatedAt: string;

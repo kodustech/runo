@@ -11,6 +11,7 @@ import { parseRecipe } from "./recipe";
 import { shq } from "./ssh";
 import {
   buildContext,
+  buildContextHere,
   contextFromEnv,
   currentBranch,
   repoTop,
@@ -31,7 +32,10 @@ Usage: runo <command> [args]
 
   init [--force]              inspects the repo and proposes .kodus/workspace.yaml
   new <name>                  creates branch task/<name> + remote env (runo up)
-  up [--branch B]             materializes/resumes the branch's env (idempotent)
+  up [--branch B] [--here]    materializes/resumes the branch's env (idempotent);
+                              --here uses the CURRENT working tree as the sync
+                              anchor (for Orca/worktree tools — runo won't
+                              create nor ever remove it)
   agent <claude|codex> [...]  agent session ON the VM (auth injected, cwd in repo)
   validate [step]             runs validate: on the VM, downloads JSON+MD evidence
   pull                        brings VM changes back to the local worktree (rsync)
@@ -60,6 +64,7 @@ interface Flags {
   follow: boolean;
   restart: boolean;
   rm: boolean;
+  here: boolean;
   positional: string[];
   passthrough: string[]; // after --
 }
@@ -72,6 +77,7 @@ function parseFlags(args: string[]): Flags {
     follow: false,
     restart: false,
     rm: false,
+    here: false,
     positional: [],
     passthrough: [],
   };
@@ -87,6 +93,7 @@ function parseFlags(args: string[]): Flags {
     } else if (a === "--force") f.force = true;
     else if (a === "--restart") f.restart = true;
     else if (a === "--rm") f.rm = true;
+    else if (a === "--here") f.here = true;
     else if (a === "--all") f.all = true;
     else if (a === "--open") f.open = true;
     else if (a === "-f" || a === "--follow") f.follow = true;
@@ -148,7 +155,13 @@ async function cmdNew(flags: Flags): Promise<void> {
 async function cmdUp(flags: Flags): Promise<void> {
   const byCwd = registry.findByCwd(process.cwd());
   let ctx: EnvContext;
-  if (byCwd && !flags.branch) {
+  if (flags.here) {
+    // the current working tree (e.g. an Orca worktree) IS the sync anchor
+    const repo = requireRepo();
+    const branch = currentBranch(repo);
+    const existing = registry.findByRepoBranch(repo, branch);
+    ctx = existing ? contextFromEnv(existing) : buildContextHere(repo, branch);
+  } else if (byCwd && !flags.branch) {
     ctx = contextFromEnv(byCwd);
   } else {
     const repo = requireRepo();
@@ -411,6 +424,11 @@ async function destroyOne(env: EnvRecord): Promise<void> {
   if ((env.runtime as any)?.id) {
     log.step(`terminating instance for ${env.name}…`);
     await provider.destroy(env.runtime as unknown as Runtime);
+  }
+  if (env.externalWorktree) {
+    registry.remove(env.name);
+    log.ok(`${env.name} destroyed (instance + registry; external worktree kept)`);
+    return;
   }
   removeWorktree(env.repoPath, env.worktree);
   registry.remove(env.name);

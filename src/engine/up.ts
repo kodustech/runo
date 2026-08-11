@@ -23,6 +23,7 @@ function baseRecord(ctx: EnvContext): EnvRecord {
       branch: ctx.branch,
       slug: ctx.slug,
       worktree: ctx.worktree,
+      externalWorktree: ctx.externalWorktree,
       provider: "aws",
       runtime: {},
       state: "creating",
