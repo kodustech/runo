@@ -65,8 +65,8 @@ export class Ec2Provider implements RuntimeProvider {
   private target(rt: Runtime): SshTarget {
     if (!rt.ip)
       throw new RunoError(
-        `Ambiente ${rt.name ?? rt.id} não tem IP público (estado: ${rt.state})`,
-        "Se estiver parado, rode `runo resume`",
+        `Environment ${rt.name ?? rt.id} has no public IP (state: ${rt.state})`,
+        "If it is stopped, run `runo resume`",
       );
     return { ip: rt.ip, user: REMOTE_USER, keyPath: this.keyPath };
   }
@@ -76,14 +76,14 @@ export class Ec2Provider implements RuntimeProvider {
       await this.sts.send(new GetCallerIdentityCommand({}));
     } catch (e: any) {
       throw new RunoError(
-        `Credenciais AWS inválidas ou ausentes (${errCode(e) || e?.message})`,
-        "Configure as credenciais (AWS_PROFILE / aws configure) e confirme com `aws sts get-caller-identity`. Região em uso: " +
+        `Invalid or missing AWS credentials (${errCode(e) || e?.message})`,
+        "Configure credentials (AWS_PROFILE / aws configure) and confirm with `aws sts get-caller-identity`. Region in use: " +
           AWS_REGION,
       );
     }
   }
 
-  // ---------- recursos compartilhados ----------
+  // ---------- shared resources ----------
 
   private async ensureKeyPair(): Promise<void> {
     mkdirSync(SSH_DIR, { recursive: true });
@@ -94,8 +94,8 @@ export class Ec2Provider implements RuntimeProvider {
         { stdout: "pipe", stderr: "pipe" },
       );
       if (gen.exitCode !== 0)
-        throw new RunoError(`Falha ao gerar chave SSH: ${gen.stderr.toString()}`);
-      // chave local nova → qualquer keypair antigo na AWS com esse nome é lixo
+        throw new RunoError(`Failed to generate SSH key: ${gen.stderr.toString()}`);
+      // fresh local key → any old AWS keypair with this name is garbage
       try {
         await this.ec2.send(new DeleteKeyPairCommand({ KeyName: this.keyName }));
       } catch {}
@@ -128,8 +128,8 @@ export class Ec2Provider implements RuntimeProvider {
       const vpcId = vpcs.Vpcs?.[0]?.VpcId;
       if (!vpcId)
         throw new RunoError(
-          `Nenhuma VPC default na região ${AWS_REGION}`,
-          "Crie uma VPC default (`aws ec2 create-default-vpc`) ou use outra região via RUNO_AWS_REGION",
+          `No default VPC in region ${AWS_REGION}`,
+          "Create a default VPC (`aws ec2 create-default-vpc`) or use another region via RUNO_AWS_REGION",
         );
       const created = await this.ec2.send(
         new CreateSecurityGroupCommand({
@@ -178,6 +178,8 @@ export class Ec2Provider implements RuntimeProvider {
     }
   }
 
+  // ---------- base image (runo bake) ----------
+
   private get bakedImagePath(): string {
     return path.join(RUNO_HOME, "aws-base-ami.json");
   }
@@ -195,12 +197,12 @@ export class Ec2Provider implements RuntimeProvider {
     const param = await this.ssm.send(new GetParameterCommand({ Name: AMI_SSM_PARAM }));
     const amiId = param.Parameter?.Value;
     if (!amiId)
-      throw new RunoError(`Não resolvi a AMI Ubuntu 24.04 via SSM em ${AWS_REGION}`);
+      throw new RunoError(`Could not resolve the Ubuntu 24.04 AMI via SSM in ${AWS_REGION}`);
     const img = await this.ec2.send(new DescribeImagesCommand({ ImageIds: [amiId] }));
     return { amiId, rootDevice: img.Images?.[0]?.RootDeviceName ?? "/dev/sda1" };
   }
 
-  /** AMI assada pelo runo bake quando disponível; senão a Ubuntu canônica. */
+  /** Baked AMI from runo bake when available; canonical Ubuntu otherwise. */
   private async resolveAmi(): Promise<{ amiId: string; rootDevice: string; baked: boolean }> {
     const baked = this.loadBakedImage();
     if (baked) {
@@ -210,7 +212,7 @@ export class Ec2Provider implements RuntimeProvider {
         if (image?.State === "available")
           return { amiId: baked.imageId, rootDevice: image.RootDeviceName ?? "/dev/sda1", baked: true };
       } catch {}
-      log.warn(`imagem assada ${baked.imageId} não está mais disponível — usando a AMI canônica (rode runo bake de novo)`);
+      log.warn(`baked image ${baked.imageId} is no longer available — using the canonical AMI (run runo bake again)`);
       rmSync(this.bakedImagePath, { force: true });
     }
     return { ...(await this.canonicalAmi()), baked: false };
@@ -229,23 +231,24 @@ export class Ec2Provider implements RuntimeProvider {
     ];
   }
 
-  /** Guardrail de custo: conta só instâncias LIGADAS (paradas custam só EBS). */
+  /** Cost guardrail: only counts RUNNING instances (stopped ones cost only EBS). */
   private async guardrail(): Promise<void> {
     const active = (await this.listManaged()).filter(
       (m) => m.state === "running" || m.state === "pending",
     );
     if (active.length >= MAX_INSTANCES)
       throw new RunoError(
-        `Guardrail de custo: ${active.length} instâncias runo ligadas (máx ${MAX_INSTANCES}): ${active
+        `Cost guardrail: ${active.length} runo instances running (max ${MAX_INSTANCES}): ${active
           .map((m) => m.name ?? m.id)
           .join(", ")}`,
-        "Suspenda/destrua ambientes (`runo ls`, `runo suspend`, `runo destroy`)",
+        "Suspend/destroy environments (`runo ls`, `runo suspend`, `runo destroy`)",
       );
   }
 
   /**
-   * RunInstances com hibernação habilitada (root criptografado); se a conta/
-   * tipo/AMI não suportarem, relança sem hibernação (fallback gracioso).
+   * RunInstances with hibernation enabled (encrypted root); if the account/
+   * type/AMI does not support it, relaunches without hibernation (graceful
+   * fallback).
    */
   private async launchInstance(opts: {
     instanceType: string;
@@ -255,14 +258,15 @@ export class Ec2Provider implements RuntimeProvider {
     spot?: boolean;
   }): Promise<string> {
     const { amiId, rootDevice, baked } = await this.resolveAmi();
-    if (baked) log.dim(`usando imagem assada ${amiId} (runo bake) — boot rápido, sem cloud-init pesado`);
+    if (baked) log.dim(`using baked image ${amiId} (runo bake) — fast boot, no heavy cloud-init`);
     const cloudInitPath = new URL("../../image/cloud-init.yaml", import.meta.url).pathname;
     const userData = baked
       ? undefined
       : Buffer.from(readFileSync(cloudInitPath, "utf8")).toString("base64");
 
-    // spot: sem hibernação e sem InstanceInitiatedShutdownBehavior (a API rejeita);
-    // interrupção/shutdown de spot persistente já resulta em "stopped"
+    // spot: no hibernation and no InstanceInitiatedShutdownBehavior (the API
+    // rejects it); interrupting/shutting down a persistent spot instance
+    // already results in "stopped"
     const input = (mode: "spot" | "hibernation" | "plain") => ({
       ImageId: amiId,
       InstanceType: opts.instanceType as any,
@@ -278,7 +282,7 @@ export class Ec2Provider implements RuntimeProvider {
             VolumeSize: opts.diskGb,
             VolumeType: "gp3" as const,
             DeleteOnTermination: true,
-            // hibernação exige root criptografado (chave default aws/ebs)
+            // hibernation requires an encrypted root (default aws/ebs key)
             ...(mode === "hibernation" ? { Encrypted: true } : {}),
           },
         },
@@ -289,13 +293,13 @@ export class Ec2Provider implements RuntimeProvider {
               MarketType: "spot" as const,
               SpotOptions: {
                 SpotInstanceType: "persistent" as const,
-                // interrupção = stop: EBS sobrevive, runo resume religa depois
+                // interruption = stop: EBS survives, runo resume restarts later
                 InstanceInterruptionBehavior: "stop" as const,
               },
             },
           }
         : {
-            // shutdown de dentro da VM (auto-suspend) = "stopped", não terminada
+            // in-VM shutdown (auto-suspend) = "stopped", not terminated
             InstanceInitiatedShutdownBehavior: "stop" as const,
           }),
       ...(mode === "hibernation" ? { HibernationOptions: { Configured: true } } : {}),
@@ -309,24 +313,24 @@ export class Ec2Provider implements RuntimeProvider {
       const code = errCode(e);
       if (code === "VcpuLimitExceeded")
         throw new RunoError(
-          "AWS recusou a instância: quota de vCPU on-demand excedida (VcpuLimitExceeded)",
-          "Destrua envs que não usa (`runo ls` / `runo destroy`) ou peça aumento de quota em Service Quotas → Running On-Demand Standard instances",
+          "AWS refused the instance: on-demand vCPU quota exceeded (VcpuLimitExceeded)",
+          "Destroy unused envs (`runo ls` / `runo destroy`) or request a quota increase in Service Quotas → Running On-Demand Standard instances",
         );
       if (code === "UnauthorizedOperation")
         throw new RunoError(
-          "AWS recusou RunInstances: sem permissão (UnauthorizedOperation)",
-          "O usuário IAM precisa de permissões EC2 (RunInstances, Describe*, CreateSecurityGroup, ImportKeyPair...)",
+          "AWS refused RunInstances: no permission (UnauthorizedOperation)",
+          "The IAM user needs EC2 permissions (RunInstances, Describe*, CreateSecurityGroup, ImportKeyPair...)",
         );
     };
 
     if (opts.spot) {
       try {
         const res = await this.ec2.send(new RunInstancesCommand(input("spot")));
-        log.dim("instância SPOT (persistente, interrupção=stop) — ~70% mais barato que on-demand");
+        log.dim("SPOT instance (persistent, interruption=stop) — ~70% cheaper than on-demand");
         return res.Instances![0]!.InstanceId!;
       } catch (e: any) {
         explainOrThrow(e);
-        log.warn(`spot indisponível agora (${errCode(e)}) — caindo para on-demand`);
+        log.warn(`spot unavailable right now (${errCode(e)}) — falling back to on-demand`);
       }
     }
     try {
@@ -334,7 +338,7 @@ export class Ec2Provider implements RuntimeProvider {
       return res.Instances![0]!.InstanceId!;
     } catch (e: any) {
       explainOrThrow(e);
-      log.warn(`launch com hibernação falhou (${errCode(e)}) — criando sem hibernação`);
+      log.warn(`launch with hibernation failed (${errCode(e)}) — creating without hibernation`);
       const res = await this.ec2.send(new RunInstancesCommand(input("plain")));
       return res.Instances![0]!.InstanceId!;
     }
@@ -345,15 +349,15 @@ export class Ec2Provider implements RuntimeProvider {
     await this.ensureKeyPair();
     const sgId = await this.ensureSecurityGroup();
 
-    // warm pool primeiro: start de instância parada é bem mais rápido que criar.
-    // Env spot NÃO usa o pool (as instâncias do pool são on-demand — não dá
-    // para converter; o launch spot direto já é rápido e é o mais barato).
+    // warm pool first: starting a stopped instance beats creating one.
+    // Spot envs do NOT use the pool (pool instances are on-demand — they can't
+    // be converted; a direct spot launch is fast and it's the cheapest path).
     if (!spec.spot) {
       try {
         const claimed = await this.claimFromPool(spec);
         if (claimed) return claimed;
       } catch (e: any) {
-        log.warn(`claim do warm pool falhou (${e?.message ?? e}) — criando do zero`);
+        log.warn(`warm pool claim failed (${e?.message ?? e}) — creating from scratch`);
       }
     }
 
@@ -364,7 +368,7 @@ export class Ec2Provider implements RuntimeProvider {
       sgId,
       spot: spec.spot,
     });
-    log.dim(`instância ${id} criada (${spec.instanceType}, ${spec.diskGb}GB gp3, ${AWS_REGION})`);
+    log.dim(`instance ${id} created (${spec.instanceType}, ${spec.diskGb}GB gp3, ${AWS_REGION})`);
     return await this.waitForState(id, "running", 5 * 60_000, true);
   }
 
@@ -405,11 +409,11 @@ export class Ec2Provider implements RuntimeProvider {
       last = await this.describe(id);
       if (last.state === want && (!requireIp || last.ip)) return last;
       if (want !== "terminated" && (last.state === "terminated" || last.state === "shutting-down"))
-        throw new RunoError(`Instância ${id} terminou inesperadamente (estado: ${last.state})`);
+        throw new RunoError(`Instance ${id} terminated unexpectedly (state: ${last.state})`);
       await sleep(5000);
     }
     throw new RunoError(
-      `Timeout esperando instância ${id} chegar a "${want}" (último estado: ${last.state})`,
+      `Timed out waiting for instance ${id} to reach "${want}" (last state: ${last.state})`,
     );
   }
 
@@ -420,18 +424,53 @@ export class Ec2Provider implements RuntimeProvider {
   async suspend(rt: Runtime): Promise<Runtime> {
     const fresh = await this.describe(rt.id);
     if (fresh.lifecycle === "spot") {
-      // spot não hiberna; stop normal (a spot request persistente fica aberta)
+      // spot cannot hibernate; plain stop (the persistent spot request stays open)
       await this.ec2.send(new StopInstancesCommand({ InstanceIds: [rt.id] }));
       return await this.waitForState(rt.id, "stopped", 10 * 60_000);
     }
     try {
       await this.ec2.send(new StopInstancesCommand({ InstanceIds: [rt.id], Hibernate: true }));
-      log.dim("hibernando (RAM → EBS): o próximo resume volta com os serviços quentes");
+      log.dim("hibernating (RAM → EBS): the next resume comes back with services hot");
     } catch (e: any) {
-      log.warn(`hibernação indisponível (${errCode(e) || e?.message}) — stop normal`);
+      log.warn(`hibernation unavailable (${errCode(e) || e?.message}) — plain stop`);
       await this.ec2.send(new StopInstancesCommand({ InstanceIds: [rt.id] }));
     }
     return await this.waitForState(rt.id, "stopped", 10 * 60_000);
+  }
+
+  async resume(rt: Runtime): Promise<Runtime> {
+    try {
+      await this.ec2.send(new StartInstancesCommand({ InstanceIds: [rt.id] }));
+    } catch (e: any) {
+      if (errCode(e) === "InsufficientInstanceCapacity")
+        throw new RunoError(
+          "No spot capacity available right now to restart the instance",
+          "Try again in a few minutes, or `runo destroy` + recreate without `limits.spot` (on-demand)",
+        );
+      throw e;
+    }
+    return await this.waitForState(rt.id, "running", 5 * 60_000, true);
+  }
+
+  async destroy(rt: Runtime): Promise<void> {
+    // persistent spot: cancel the request BEFORE terminating, otherwise AWS
+    // launches a replacement instance (respawn = leaking cost)
+    try {
+      const fresh = await this.describe(rt.id);
+      if (fresh.spotRequestId) {
+        await this.ec2.send(
+          new CancelSpotInstanceRequestsCommand({ SpotInstanceRequestIds: [fresh.spotRequestId] }),
+        );
+        log.dim(`spot request ${fresh.spotRequestId} cancelled`);
+      }
+    } catch {}
+    try {
+      await this.ec2.send(new TerminateInstancesCommand({ InstanceIds: [rt.id] }));
+    } catch (e: any) {
+      if (errCode(e) === "InvalidInstanceID.NotFound") return;
+      throw e;
+    }
+    await this.waitForState(rt.id, "terminated", 8 * 60_000);
   }
 
   // ---------- warm pool ----------
@@ -456,18 +495,18 @@ export class Ec2Provider implements RuntimeProvider {
     return await this.listPool();
   }
 
-  /** Reivindica uma instância parada do pool: retag + ajusta tipo/disco + start. */
+  /** Claims a stopped pool instance: retag + adjust type/disk + start. */
   private async claimFromPool(spec: CreateSpec): Promise<Runtime | null> {
     const idle = (await this.listPool()).filter((p) => p.state === "stopped");
     const inst = idle[0];
     if (!inst) return null;
-    log.step(`reivindicando instância do warm pool (${inst.id}) — start ≫ create`);
+    log.step(`claiming warm pool instance (${inst.id}) — start ≫ create`);
     await this.ec2.send(new CreateTagsCommand({ Resources: [inst.id], Tags: this.envTags(spec) }));
     await this.ec2.send(
       new DeleteTagsCommand({ Resources: [inst.id], Tags: [{ Key: "runo:role" }] }),
     );
     if (inst.instanceType !== spec.instanceType) {
-      log.dim(`ajustando tipo ${inst.instanceType} → ${spec.instanceType} (instância parada)`);
+      log.dim(`adjusting type ${inst.instanceType} → ${spec.instanceType} (instance stopped)`);
       await this.ec2.send(
         new ModifyInstanceAttributeCommand({
           InstanceId: inst.id,
@@ -482,7 +521,7 @@ export class Ec2Provider implements RuntimeProvider {
     );
     const root = vols.Volumes?.[0];
     if (root?.VolumeId && (root.Size ?? 0) < spec.diskGb) {
-      log.dim(`crescendo disco ${root.Size}GB → ${spec.diskGb}GB (cloud-init expande o fs no boot)`);
+      log.dim(`growing disk ${root.Size}GB → ${spec.diskGb}GB (cloud-init expands the fs on boot)`);
       await this.ec2.send(new ModifyVolumeCommand({ VolumeId: root.VolumeId, Size: spec.diskGb }));
     }
     await this.ec2.send(new StartInstancesCommand({ InstanceIds: [inst.id] }));
@@ -491,7 +530,7 @@ export class Ec2Provider implements RuntimeProvider {
 
   async poolScale(target: number): Promise<void> {
     if (target < 0 || target > 3 || !Number.isInteger(target))
-      throw new RunoError("runo pool aceita tamanho de 0 a 3");
+      throw new RunoError("runo pool accepts a size from 0 to 3");
     await this.ensureKeyPair();
     const sgId = await this.ensureSecurityGroup();
     const poolTags: Tag[] = [
@@ -502,16 +541,16 @@ export class Ec2Provider implements RuntimeProvider {
     ];
 
     let pool = await this.listPool();
-    // encolher: termina paradas excedentes
+    // shrink: terminate excess stopped instances
     const excess = pool.filter((p) => p.state === "stopped").slice(0, Math.max(0, pool.length - target));
     for (const p of excess) {
-      log.step(`removendo ${p.id} do pool…`);
+      log.step(`removing ${p.id} from the pool…`);
       await this.ec2.send(new TerminateInstancesCommand({ InstanceIds: [p.id] }));
     }
-    // crescer: provisiona e para
+    // grow: provision and stop
     while ((pool = await this.listPool()).length < target) {
       await this.guardrail();
-      log.step(`provisionando instância ${pool.length + 1}/${target} do pool…`);
+      log.step(`provisioning pool instance ${pool.length + 1}/${target}…`);
       const id = await this.launchInstance({
         instanceType: "t3.medium",
         diskGb: 30,
@@ -520,50 +559,15 @@ export class Ec2Provider implements RuntimeProvider {
       });
       const rt = await this.waitForState(id, "running", 5 * 60_000, true);
       await this.waitReady(rt, { firstBoot: true });
-      // auto-suspend desligado enquanto está no pool (o claim escreve o valor da recipe)
+      // auto-suspend disabled while in the pool (claim writes the recipe value)
       await this.exec(rt, "sudo mkdir -p /etc/runo && echo 0 | sudo tee /etc/runo/idle-limit >/dev/null");
       await this.ec2.send(new StopInstancesCommand({ InstanceIds: [id] }));
       await this.waitForState(id, "stopped", 10 * 60_000);
-      log.ok(`${id} pronta e parada no pool (custo: só EBS)`);
+      log.ok(`${id} ready and stopped in the pool (cost: EBS only)`);
     }
   }
 
-  async resume(rt: Runtime): Promise<Runtime> {
-    try {
-      await this.ec2.send(new StartInstancesCommand({ InstanceIds: [rt.id] }));
-    } catch (e: any) {
-      if (errCode(e) === "InsufficientInstanceCapacity")
-        throw new RunoError(
-          "Sem capacidade spot disponível agora para religar a instância",
-          "Tente de novo em alguns minutos, ou `runo destroy` + recrie sem `limits.spot` (on-demand)",
-        );
-      throw e;
-    }
-    return await this.waitForState(rt.id, "running", 5 * 60_000, true);
-  }
-
-  async destroy(rt: Runtime): Promise<void> {
-    // spot persistente: cancelar a request ANTES de terminar, senão a AWS
-    // relança outra instância no lugar (respawn = custo vazando)
-    try {
-      const fresh = await this.describe(rt.id);
-      if (fresh.spotRequestId) {
-        await this.ec2.send(
-          new CancelSpotInstanceRequestsCommand({ SpotInstanceRequestIds: [fresh.spotRequestId] }),
-        );
-        log.dim(`spot request ${fresh.spotRequestId} cancelada`);
-      }
-    } catch {}
-    try {
-      await this.ec2.send(new TerminateInstancesCommand({ InstanceIds: [rt.id] }));
-    } catch (e: any) {
-      if (errCode(e) === "InvalidInstanceID.NotFound") return;
-      throw e;
-    }
-    await this.waitForState(rt.id, "terminated", 8 * 60_000);
-  }
-
-  // ---------- exec / arquivos ----------
+  // ---------- exec / files ----------
 
   private wrap(command: string, cwd?: string): string {
     const inner = cwd ? `cd ${shq(cwd)} && { ${command} ; }` : command;
@@ -586,7 +590,7 @@ export class Ec2Provider implements RuntimeProvider {
     if (dir && dir !== "." && dir !== "/") await this.exec(rt, `mkdir -p ${shq(dir)}`);
     const res = await scpUpload(this.target(rt), localPath, remotePath);
     if (res.exitCode !== 0)
-      throw new RunoError(`Upload de ${localPath} falhou: ${res.stderr.trim()}`);
+      throw new RunoError(`Upload of ${localPath} failed: ${res.stderr.trim()}`);
   }
 
   async uploadDir(
@@ -597,7 +601,7 @@ export class Ec2Provider implements RuntimeProvider {
   ): Promise<void> {
     const res = await rsyncPush(this.target(rt), localPath, remotePath, excludes);
     if (res.exitCode !== 0)
-      throw new RunoError(`Push de ${localPath} falhou: ${res.stderr.trim()}`);
+      throw new RunoError(`Push of ${localPath} failed: ${res.stderr.trim()}`);
   }
 
   async download(
@@ -608,7 +612,7 @@ export class Ec2Provider implements RuntimeProvider {
   ): Promise<void> {
     const res = await rsyncPull(this.target(rt), remotePath, localPath, excludes);
     if (res.exitCode !== 0)
-      throw new RunoError(`Download de ${remotePath} falhou: ${res.stderr.trim()}`);
+      throw new RunoError(`Download of ${remotePath} failed: ${res.stderr.trim()}`);
   }
 
   serviceUrls(rt: Runtime, ports: number[]): string[] {
@@ -635,11 +639,11 @@ export class Ec2Provider implements RuntimeProvider {
     }
     if (!up)
       throw new RunoError(
-        `SSH não respondeu em ${rt.ip} após 5min`,
-        "Confira o security group (porta 22) e o estado da instância com `runo ls`",
+        `SSH did not respond at ${rt.ip} after 5min`,
+        "Check the security group (port 22) and the instance state with `runo ls`",
       );
     if (opts.firstBoot)
-      log.step("aguardando provisionamento (cloud-init) — primeiro boot leva alguns minutos…");
+      log.step("waiting for provisioning (cloud-init) — first boot takes a few minutes…");
     const ci = await this.exec(rt, "cloud-init status --wait || true; cloud-init status", {
       timeoutMs: 20 * 60_000,
     });
@@ -647,15 +651,15 @@ export class Ec2Provider implements RuntimeProvider {
     if (!/status:\s*(done|degraded)/.test(out)) {
       const tail = await this.exec(rt, "tail -n 40 /var/log/cloud-init-output.log");
       throw new RunoError(
-        `cloud-init não terminou com sucesso (${out.trim().split("\n").pop()})`,
-        `Últimas linhas do log de provisionamento:\n${tail.stdout}`,
+        `cloud-init did not finish successfully (${out.trim().split("\n").pop()})`,
+        `Last lines of the provisioning log:\n${tail.stdout}`,
       );
     }
     if (/status:\s*degraded/.test(out))
-      log.warn("cloud-init terminou 'degraded' — validando o tooling essencial mesmo assim");
+      log.warn("cloud-init finished 'degraded' — validating essential tooling anyway");
   }
 
-  // ---------- imagem base (runo bake) ----------
+  // ---------- base image (runo bake) ----------
 
   async prepareBootImage(): Promise<string> {
     await this.guardrail();
@@ -671,7 +675,7 @@ export class Ec2Provider implements RuntimeProvider {
       { Key: "runo:role", Value: "bake" },
     ];
 
-    log.step("subindo VM temporária para assar a imagem base (cloud-init completo)…");
+    log.step("launching a temporary VM to bake the base image (full cloud-init)…");
     const res = await this.ec2.send(
       new RunInstancesCommand({
         ImageId: amiId,
@@ -702,13 +706,13 @@ export class Ec2Provider implements RuntimeProvider {
       );
       if (check.exitCode !== 0)
         throw new RunoError(
-          "Tooling incompleto na VM de bake — imagem NÃO foi criada",
+          "Incomplete tooling on the bake VM — image was NOT created",
           check.stderr.trim().split("\n").pop(),
         );
-      // estado do cloud-init limpo: o próximo boot da imagem re-executa só o
-      // essencial (ssh keys/hostname) em segundos
+      // clean cloud-init state: the image's next boot re-runs only the
+      // essentials (ssh keys/hostname) in seconds
       await this.exec(rt, "sudo cloud-init clean --logs");
-      log.step("parando a VM e criando a imagem (CreateImage)…");
+      log.step("stopping the VM and creating the image (CreateImage)…");
       await this.ec2.send(new StopInstancesCommand({ InstanceIds: [id] }));
       await this.waitForState(id, "stopped", 10 * 60_000);
       const img = await this.ec2.send(
@@ -728,9 +732,9 @@ export class Ec2Provider implements RuntimeProvider {
         const d = await this.ec2.send(new DescribeImagesCommand({ ImageIds: [imageId] }));
         const state = d.Images?.[0]?.State;
         if (state === "available") break;
-        if (state === "failed") throw new RunoError(`CreateImage falhou (${imageId})`);
+        if (state === "failed") throw new RunoError(`CreateImage failed (${imageId})`);
         if (Date.now() > deadline)
-          throw new RunoError(`Timeout esperando a imagem ${imageId} ficar disponível`);
+          throw new RunoError(`Timed out waiting for image ${imageId} to become available`);
         await sleep(10_000);
       }
       const old = this.loadBakedImage();
@@ -767,19 +771,19 @@ export class Ec2Provider implements RuntimeProvider {
   async removeBootImage(): Promise<void> {
     const baked = this.loadBakedImage();
     if (!baked) {
-      log.warn("nenhuma imagem assada para remover (runo bake não foi rodado)");
+      log.warn("no baked image to remove (runo bake was never run)");
       return;
     }
     await this.deregisterImage(baked.imageId);
     rmSync(this.bakedImagePath, { force: true });
-    log.ok(`imagem ${baked.imageId} e snapshot removidos`);
+    log.ok(`image ${baked.imageId} and snapshot removed`);
   }
 
-  // ---------- inventário / limpeza ----------
+  // ---------- inventory / cleanup ----------
 
   async listManaged(): Promise<Runtime[]> {
-    // Escopado por runo:home-hash: instalações paralelas do runo na mesma conta
-    // (RUNO_HOMEs distintos) não podem contar/destruir instâncias umas das outras.
+    // Scoped by runo:home-hash: parallel runo installs in the same account
+    // (distinct RUNO_HOMEs) must not count/destroy each other's instances.
     const res = await this.ec2.send(
       new DescribeInstancesCommand({
         Filters: [
@@ -798,7 +802,7 @@ export class Ec2Provider implements RuntimeProvider {
   async cleanupShared(): Promise<void> {
     try {
       await this.ec2.send(new DeleteKeyPairCommand({ KeyName: this.keyName }));
-      log.dim(`keypair ${this.keyName} removido da AWS`);
+      log.dim(`keypair ${this.keyName} removed from AWS`);
     } catch {}
     const found = await this.ec2.send(
       new DescribeSecurityGroupsCommand({
@@ -810,18 +814,18 @@ export class Ec2Provider implements RuntimeProvider {
     for (let attempt = 0; attempt < 12; attempt++) {
       try {
         await this.ec2.send(new DeleteSecurityGroupCommand({ GroupId: sgId }));
-        log.dim(`security group ${this.sgName} removido`);
+        log.dim(`security group ${this.sgName} removed`);
         return;
       } catch (e: any) {
         if (errCode(e) === "DependencyViolation") {
-          await sleep(10_000); // instâncias ainda terminando
+          await sleep(10_000); // instances still terminating
           continue;
         }
         throw e;
       }
     }
     log.warn(
-      `security group ${this.sgName} ainda tem dependências — remova depois com: aws ec2 delete-security-group --group-id ${sgId}`,
+      `security group ${this.sgName} still has dependencies — remove it later with: aws ec2 delete-security-group --group-id ${sgId}`,
     );
   }
 }

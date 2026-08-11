@@ -13,8 +13,8 @@ export function getProvider(name = "aws"): RuntimeProvider {
   const factory = providers[name];
   if (!factory)
     throw new RunoError(
-      `Provider "${name}" desconhecido`,
-      `Providers disponíveis: ${Object.keys(providers).join(", ")}`,
+      `Unknown provider "${name}"`,
+      `Available providers: ${Object.keys(providers).join(", ")}`,
     );
   cached = factory();
   return cached;

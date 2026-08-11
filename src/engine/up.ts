@@ -10,7 +10,7 @@ import { shq } from "../ssh";
 import { git, type EnvContext } from "./context";
 import { healthcheckPublic, probeServices, startServices, waitInternalPorts } from "./services";
 
-/** Ferramentas que o cloud-init precisa ter deixado prontas na VM. */
+/** Tooling that cloud-init must have left ready on the VM. */
 const TOOLING_CHECK =
   "docker --version && docker compose version && git --version && tmux -V && rsync --version | head -1 && node --version && bun --version && pnpm --version && claude --version && codex --version";
 
@@ -39,13 +39,13 @@ async function uploadCode(
   ctx: EnvContext,
   remoteDir: string,
 ): Promise<void> {
-  // Código sobe por git archive (só tracked) — zero credencial Git na nuvem (decisão 8)
-  log.step("subindo código (git archive HEAD)…");
+  // Code travels via git archive (tracked files only) — zero git credentials in the cloud
+  log.step("uploading code (git archive HEAD)…");
   mkdirSync(TMP_DIR, { recursive: true });
   const tarPath = path.join(TMP_DIR, `${ctx.envName}-code.tar`);
   const archive = git(ctx.worktree, "archive", "--format=tar", "-o", tarPath, "HEAD");
   if (archive.exitCode !== 0)
-    throw new RunoError(`git archive falhou no worktree ${ctx.worktree}: ${archive.stderr}`);
+    throw new RunoError(`git archive failed in worktree ${ctx.worktree}: ${archive.stderr}`);
   await provider.upload(rt, tarPath, "/tmp/runo-code.tar");
   rmSync(tarPath, { force: true });
   const extract = await provider.exec(
@@ -53,23 +53,23 @@ async function uploadCode(
     `rm -rf ${shq(remoteDir)} && mkdir -p ${shq(remoteDir)} && tar -xf /tmp/runo-code.tar -C ${shq(remoteDir)} && rm -f /tmp/runo-code.tar`,
   );
   if (extract.exitCode !== 0)
-    throw new RunoError(`Extração do código na VM falhou: ${extract.stderr.trim()}`);
+    throw new RunoError(`Code extraction on the VM failed: ${extract.stderr.trim()}`);
 
-  // files.copy: untracked obrigatórios (ex.: .env) — do worktree, senão do repo original
+  // files.copy: required untracked files (e.g. .env) — from the worktree, else the original repo
   for (const rel of ctx.recipe.filesCopy) {
     const fromWorktree = path.join(ctx.worktree, rel);
     const fromRepo = path.join(ctx.repoPath, rel);
     const src = existsSync(fromWorktree) ? fromWorktree : existsSync(fromRepo) ? fromRepo : null;
     if (!src)
       throw new RunoError(
-        `files.copy: "${rel}" não existe nem no worktree nem em ${ctx.repoPath}`,
-        "Crie o arquivo (ex.: .env de DESENVOLVIMENTO — a URL do env é pública, nunca use credencial de produção)",
+        `files.copy: "${rel}" exists neither in the worktree nor in ${ctx.repoPath}`,
+        "Create the file (e.g. a DEVELOPMENT .env — the env's URL is public, never use production credentials)",
       );
-    log.step(`copiando untracked: ${rel}`);
+    log.step(`copying untracked file: ${rel}`);
     await provider.upload(rt, src, path.posix.join(remoteDir, rel));
   }
 
-  // git na VM para o agente poder trabalhar lá (decisão 8)
+  // git on the VM so the agent can work there
   const localSha = git(ctx.worktree, "rev-parse", "--short", "HEAD").stdout || "unknown";
   const init = await provider.exec(
     rt,
@@ -77,7 +77,7 @@ async function uploadCode(
     { cwd: remoteDir },
   );
   if (init.exitCode !== 0)
-    throw new RunoError(`git init/commit na VM falhou: ${init.stderr.trim()}`);
+    throw new RunoError(`git init/commit on the VM failed: ${init.stderr.trim()}`);
 }
 
 async function runSteps(
@@ -97,12 +97,12 @@ async function runSteps(
       last = r.exitCode;
       if (last === 0) break;
       if (i < attempts) {
-        log.warn(`"${cmd}" falhou (exit ${last}) — tentativa ${i + 1}/${attempts} em 5s…`);
+        log.warn(`"${cmd}" failed (exit ${last}) — attempt ${i + 1}/${attempts} in 5s…`);
         await new Promise((r2) => setTimeout(r2, 5000));
       }
     }
     if (last !== 0)
-      throw new RunoError(`Step de ${label} falhou (exit ${last}): ${cmd}`, "Saída acima; a VM continua de pé para inspeção via `runo exec`");
+      throw new RunoError(`${label} step failed (exit ${last}): ${cmd}`, "Output above; the VM stays up for inspection via `runo exec`");
   }
 }
 
@@ -123,11 +123,11 @@ async function finishUp(
   }
   await healthcheckPublic(provider, rt, ctx.recipe, remoteDir, plan.publicServices);
 
-  // auto-suspend por inatividade (watchdog na VM lê /etc/runo/idle-limit)
+  // idle auto-suspend (the on-VM watchdog reads /etc/runo/idle-limit)
   const idle = ctx.recipe.limits.idleSuspendSec;
   await provider.exec(rt, `sudo mkdir -p /etc/runo && echo ${idle} | sudo tee /etc/runo/idle-limit >/dev/null`);
   if (idle > 0)
-    log.dim(`auto-suspend: a VM se suspende sozinha após ${Math.round(idle / 60)}min sem atividade (limits.idle_suspend)`);
+    log.dim(`auto-suspend: the VM suspends itself after ${Math.round(idle / 60)}min of inactivity (limits.idle_suspend)`);
 
   const updated = registry.upsert({
     ...env,
@@ -138,14 +138,14 @@ async function finishUp(
     lastUpAt: new Date().toISOString(),
   });
   const urls = urlsFor(updated, rt.ip);
-  log.ok(`ambiente ${ctx.envName} de pé`);
+  log.ok(`environment ${ctx.envName} is up`);
   for (const [svc, url] of Object.entries(urls)) console.log(`  ${svc}: ${url}`);
   return updated;
 }
 
 /**
- * Materializa/resume/reconcilia o ambiente remoto da branch (idempotente —
- * comportamento do `runo up`).
+ * Materializes/resumes/reconciles the branch's remote environment (idempotent —
+ * the behavior of `runo up`).
  */
 export async function upEnv(ctx: EnvContext): Promise<EnvRecord> {
   const provider = getProvider("aws");
@@ -156,16 +156,16 @@ export async function upEnv(ctx: EnvContext): Promise<EnvRecord> {
   if (env.runtime && (env.runtime as any).id) {
     rt = await provider.status(env.runtime as unknown as Runtime);
     if (rt.state === "terminated" || rt.state === "shutting-down" || rt.state === "unknown") {
-      log.warn(`instância anterior do env não existe mais (${rt.state}) — recriando`);
+      log.warn(`the env's previous instance no longer exists (${rt.state}) — recreating`);
       rt = null;
       env = { ...env, runtime: {}, state: "creating", materialized: false };
     }
   }
 
   if (!rt) {
-    // ---- materialização do zero ----
+    // ---- materialize from scratch ----
     log.step(
-      `criando VM para ${ctx.envName} (${ctx.recipe.limits.instance}, ${ctx.recipe.limits.diskGb}GB)…`,
+      `creating VM for ${ctx.envName} (${ctx.recipe.limits.instance}, ${ctx.recipe.limits.diskGb}GB)…`,
     );
     env = registry.upsert({ ...env, state: "creating" });
     rt = await provider.create({
@@ -183,7 +183,7 @@ export async function upEnv(ctx: EnvContext): Promise<EnvRecord> {
       state: "provisioning",
     });
     await provider.waitReady(rt, { firstBoot: true });
-    // retry: logo após o boot o sshd pode reiniciar / regenerar host key no meio
+    // retry: right after boot, sshd may restart / regenerate host keys mid-check
     let tooling = { exitCode: 1, stdout: "", stderr: "" };
     for (let i = 0; i < 4 && tooling.exitCode !== 0; i++) {
       if (i > 0) await new Promise((r) => setTimeout(r, 15_000));
@@ -191,8 +191,8 @@ export async function upEnv(ctx: EnvContext): Promise<EnvRecord> {
     }
     if (tooling.exitCode !== 0)
       throw new RunoError(
-        "Tooling da VM incompleto após o boot",
-        `Falhou: ${tooling.stderr.trim().split("\n").pop()}\nInspecione: runo exec -- cat /var/log/cloud-init-output.log`,
+        "Incomplete tooling on the VM after boot",
+        `Failed: ${tooling.stderr.trim().split("\n").pop()}\nInspect with: runo exec -- cat /var/log/cloud-init-output.log`,
       );
     const remoteDir = remoteRepoDir(ctx.repoName);
     await uploadCode(provider, rt, ctx, remoteDir);
@@ -201,53 +201,53 @@ export async function upEnv(ctx: EnvContext): Promise<EnvRecord> {
   }
 
   if (rt.state === "stopped" || rt.state === "stopping") {
-    log.step("ambiente parado — retomando (runo up é idempotente)…");
+    log.step("environment is stopped — resuming (runo up is idempotent)…");
     return await resumeEnv(ctx);
   }
 
-  if (rt.state === "pending") rt = await provider.resume(rt); // espera running
+  if (rt.state === "pending") rt = await provider.resume(rt); // waits for running
 
-  // reconcile só vale se a materialização completou E o repo ainda existe na VM
+  // reconcile only applies if materialization completed AND the repo still exists on the VM
   const remoteDir = remoteRepoDir(ctx.repoName);
   const repoExists =
     env.materialized === true &&
     (await provider.exec(rt, `test -d ${shq(remoteDir)}`)).exitCode === 0;
 
   if (!repoExists) {
-    log.warn("materialização anterior incompleta — refazendo upload/setup/serviços");
+    log.warn("previous materialization incomplete — redoing upload/setup/services");
     await provider.waitReady(rt);
     await uploadCode(provider, rt, ctx, remoteDir);
     await runSteps(provider, rt, remoteDir, "setup", ctx.recipe.setup);
     return await finishUp(provider, rt, ctx, env, { runData: true });
   }
 
-  // ---- reconcile de env já rodando ----
-  log.step("ambiente já existe — reconciliando serviços e healthcheck…");
+  // ---- reconcile a running env ----
+  log.step("environment already exists — reconciling services and health check…");
   return await finishUp(provider, rt, ctx, env, { runData: false });
 }
 
-/** Start da instância + redetecção de IP + serviços de volta (critério 9). */
+/** Instance start + IP redetection + services back up. */
 export async function resumeEnv(ctx: EnvContext): Promise<EnvRecord> {
   const provider = getProvider("aws");
   const env = registry.get(ctx.envName);
   if (!env?.runtime || !(env.runtime as any).id)
-    throw new RunoError(`Ambiente ${ctx.envName} não existe no registry`, "Crie com `runo new` / `runo up`");
+    throw new RunoError(`Environment ${ctx.envName} does not exist in the registry`, "Create it with `runo new` / `runo up`");
   let rt = await provider.status(env.runtime as unknown as Runtime);
   if (rt.state === "terminated")
-    throw new RunoError(`A instância do env ${ctx.envName} foi terminada`, "Recrie com `runo up`");
+    throw new RunoError(`The instance for env ${ctx.envName} was terminated`, "Recreate it with `runo up`");
   if (rt.state === "running") {
-    log.step("instância já está rodando — reconciliando serviços…");
+    log.step("instance is already running — reconciling services…");
   } else {
-    log.step("iniciando instância (o IP público MUDA no stop/start)…");
+    log.step("starting the instance (the public IP CHANGES on stop/start)…");
     rt = await provider.resume(rt);
-    log.ok(`novo IP público: ${rt.ip}`);
+    log.ok(`new public IP: ${rt.ip}`);
   }
   registry.upsert({ ...env, runtime: rt as unknown as Record<string, unknown>, state: "running" });
   await provider.waitReady(rt);
 
-  // volta quente de hibernação? serviços já respondendo = não religar nada
+  // hot return from hibernation? services already answering = restart nothing
   if (await probeServices(rt, env.publicServices)) {
-    log.ok("serviços já quentes (resume de hibernação) — nada a religar");
+    log.ok("services already hot (hibernation resume) — nothing to restart");
     const updated = registry.upsert({
       ...env,
       runtime: rt as unknown as Record<string, unknown>,

@@ -1,4 +1,4 @@
-// Lint minimalista: transpila cada .ts do projeto — erro de sintaxe reprova.
+// Minimal lint: transpiles every .ts in the project — syntax errors fail it.
 import { Glob } from "bun";
 
 const transpiler = new Bun.Transpiler({ loader: "ts" });
@@ -10,7 +10,7 @@ for await (const file of new Glob("{src,scripts}/**/*.ts").scan(".")) {
     console.log(`lint ok: ${file}`);
   } catch (e) {
     failed = true;
-    console.error(`lint FALHOU: ${file}: ${e}`);
+    console.error(`lint FAILED: ${file}: ${e}`);
   }
 }
 

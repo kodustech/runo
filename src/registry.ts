@@ -5,7 +5,7 @@ import { RUNO_HOME, REGISTRY_PATH } from "./config";
 export interface PublicService {
   name: string;
   port: number;
-  health?: string; // path HTTP; ausente = check TCP
+  health?: string; // HTTP path; absent = TCP check
   healthTimeoutSec?: number; // default 120
 }
 
@@ -17,10 +17,10 @@ export interface EnvRecord {
   slug: string;
   worktree: string;
   provider: string; // "aws"
-  runtime: Record<string, unknown>; // dados opacos do provider (instanceId, ip, ...)
+  runtime: Record<string, unknown>; // opaque provider data (instanceId, ip, ...)
   state: "creating" | "provisioning" | "running" | "stopped" | "error";
-  /** true somente após o pipeline completo (upload+setup+serviços+health) — o
-   * estado da instância NÃO substitui isto: um up interrompido fica false. */
+  /** true only after the full pipeline (upload+setup+services+health) — the
+   * instance state does NOT substitute this: an interrupted up stays false. */
   materialized?: boolean;
   publicServices: PublicService[];
   createdAt: string;
@@ -42,10 +42,10 @@ function loadFile(): RegistryFile {
     return { version: 1, envs: {} };
   }
   if (!parsed || typeof parsed !== "object" || typeof parsed.envs !== "object" || parsed.envs === null) {
-    // registry escrito por outra instalação/versão do runo — não sobrescrever às cegas
+    // registry written by another install/version — never overwrite blindly
     throw new Error(
-      `${REGISTRY_PATH} existe mas não está no formato deste runo (esperado {version, envs}). ` +
-        `Outra instalação do runo pode estar usando este RUNO_HOME — use um RUNO_HOME dedicado.`,
+      `${REGISTRY_PATH} exists but is not in this runo's format (expected {version, envs}). ` +
+        `Another runo install may be using this RUNO_HOME — use a dedicated RUNO_HOME.`,
     );
   }
   return parsed as RegistryFile;

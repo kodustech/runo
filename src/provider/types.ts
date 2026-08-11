@@ -1,6 +1,6 @@
 /**
- * Interface do runtime (decisão 1): nada fora do provider pode conhecer o
- * provedor de nuvem concreto. O engine fala apenas estes métodos.
+ * Runtime interface: nothing outside the provider may know the concrete cloud.
+ * The engine speaks only these methods.
  */
 export interface CreateSpec {
   envName: string;
@@ -9,7 +9,7 @@ export interface CreateSpec {
   diskGb: number;
   repo: string;
   branch: string;
-  /** Capacidade spot (interrupção = stop, dados sobrevivem; fallback on-demand). */
+  /** Spot capacity (interruption = stop, data survives; on-demand fallback). */
   spot?: boolean;
 }
 
@@ -29,7 +29,7 @@ export interface Runtime {
   instanceType?: string;
   launchedAt?: string;
   name?: string;
-  /** "spot" quando a instância é spot (afeta suspend/destroy). */
+  /** "spot" when the instance is spot (affects suspend/destroy). */
   lifecycle?: string;
   spotRequestId?: string;
   [extra: string]: unknown;
@@ -50,13 +50,13 @@ export interface ExecResult {
 export interface RuntimeProvider {
   readonly name: string;
 
-  /** Valida credenciais/acesso; erro acionável se não der. */
+  /** Validates credentials/access; actionable error otherwise. */
   preflight(): Promise<void>;
 
-  /** Cria a VM do env (inclui guardrail de instâncias simultâneas). */
+  /** Creates the env's VM (includes the simultaneous-instances guardrail). */
   create(spec: CreateSpec): Promise<Runtime>;
 
-  /** Espera a VM aceitar exec e o provisionamento (cloud-init) terminar. */
+  /** Waits until the VM accepts exec and provisioning (cloud-init) finishes. */
   waitReady(rt: Runtime, opts?: { firstBoot?: boolean }): Promise<void>;
 
   status(rt: Runtime): Promise<Runtime>;
@@ -64,38 +64,38 @@ export interface RuntimeProvider {
   resume(rt: Runtime): Promise<Runtime>;
   destroy(rt: Runtime): Promise<void>;
 
-  /** Abre as portas públicas do env para o mundo (idempotente). */
+  /** Opens the env's public ports to the world (idempotent). */
   ensurePorts(ports: number[]): Promise<void>;
 
   exec(rt: Runtime, command: string, opts?: ExecOpts): Promise<ExecResult>;
-  /** stdio herdado (sessão de agente, runo exec, logs -f). */
+  /** Inherited stdio (agent session, runo exec, logs -f). */
   execInteractive(rt: Runtime, command: string, opts?: { cwd?: string }): Promise<number>;
 
   upload(rt: Runtime, localPath: string, remotePath: string): Promise<void>;
-  /** Sync de diretório local→VM (runo push). */
+  /** Local→VM directory sync (runo push). */
   uploadDir(rt: Runtime, localPath: string, remotePath: string, excludes?: string[]): Promise<void>;
   download(rt: Runtime, remotePath: string, localPath: string, excludes?: string[]): Promise<void>;
 
   serviceUrls(rt: Runtime, ports: number[]): string[];
 
-  /** Streama um comando de log remoto (tail -f, docker compose logs...). */
+  /** Streams a remote log command (tail -f, docker compose logs...). */
   logs(rt: Runtime, command: string, opts?: { cwd?: string }): Promise<number>;
 
   /**
-   * Assa uma imagem base de boot com o provisionamento pronto (runo bake) —
-   * ups seguintes bootam em ~1-2min em vez de rodar o cloud-init inteiro.
+   * Bakes a base boot image with provisioning done (runo bake) —
+   * subsequent ups boot in ~1-2min instead of running full cloud-init.
    */
   prepareBootImage(): Promise<string>;
-
-  /** Warm pool: instâncias provisionadas e paradas, prontas para claim no create. */
-  poolStatus(): Promise<Runtime[]>;
-  poolScale(target: number): Promise<void>;
-  /** Remove a imagem base assada (runo bake --rm). */
+  /** Removes the baked base image (runo bake --rm). */
   removeBootImage(): Promise<void>;
 
-  /** Todas as instâncias gerenciadas pelo runo ainda vivas (guardrail + auditoria). */
+  /** Warm pool: provisioned, stopped instances ready to be claimed on create. */
+  poolStatus(): Promise<Runtime[]>;
+  poolScale(target: number): Promise<void>;
+
+  /** All runo-managed instances still alive (guardrail + audit). */
   listManaged(): Promise<Runtime[]>;
 
-  /** Remove recursos compartilhados (keypair, security group) — runo destroy --all. */
+  /** Removes shared resources (keypair, security group) — runo destroy --all. */
   cleanupShared(): Promise<void>;
 }

@@ -1,15 +1,17 @@
 # demo-app
 
-API mínima em Bun usada para exercitar o `runo` de ponta a ponta:
+Minimal Bun API used to exercise runo end to end:
 
 - `GET /health` — liveness
-- `GET /items` — lê do Postgres (3 rows após `db:seed`)
+- `GET /items` — reads from Postgres (3 rows after `db:seed`)
 
-Recipe completa em `.kodus/workspace.yaml`. Fluxo esperado:
+Full recipe in `.kodus/workspace.yaml`. To try it, copy this folder outside the
+runo repo and `git init` it (runo targets git repositories):
 
 ```bash
-runo new teste-a     # branch task/teste-a + ambiente remoto EC2
+cp -R examples/demo-app ~/demo-app && cd ~/demo-app && git init -b main && git add -A && git commit -m init
+runo new test-a      # branch task/test-a + remote EC2 environment
 curl $(runo url)/items
-runo validate        # lint + test na VM, evidência em .kodus/evidence/
+runo validate        # lint + test on the VM, evidence in .kodus/evidence/
 runo destroy
 ```

@@ -13,15 +13,15 @@ const REMOTE_COMPOSE = `${REMOTE_RUNO_DIR}/compose.yaml`;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export interface ServicePlan {
-  publicServices: PublicService[]; // nome + porta + health path (vira URL/SG)
-  internalPorts: number[]; // portas a esperar na própria VM
+  publicServices: PublicService[]; // name + port + health path (becomes URL/SG)
+  internalPorts: number[]; // ports to wait for on the VM itself
 }
 
 export function tmuxSession(svc: string): string {
   return `runo-${svc}`;
 }
 
-/** Prefixo docker compose do modo passthrough (arquivo + profiles do repo). */
+/** docker compose prefix for passthrough mode (repo's file + profiles). */
 export function composePrefix(recipe: NormalizedRecipe): string {
   const c = recipe.compose!;
   const profiles = c.profiles.map((p) => ` --profile ${shq(p)}`).join("");
@@ -44,8 +44,8 @@ function generatedComposeYaml(recipe: NormalizedRecipe): string {
 }
 
 /**
- * Sobe os serviços da recipe NA VM (decisão 11) e devolve o plano de portas.
- * Idempotente — usado no up, resume e reconcile.
+ * Starts the recipe's services ON the VM and returns the port plan.
+ * Idempotent — used by up, resume and reconcile.
  */
 export async function startServices(
   provider: RuntimeProvider,
@@ -59,7 +59,7 @@ export async function startServices(
   const runSvcs = Object.entries(recipe.services).filter(([, s]) => s.run);
 
   if (imageSvcs.length > 0) {
-    log.step(`subindo ${imageSvcs.length} serviço(s) de imagem (docker compose)…`);
+    log.step(`starting ${imageSvcs.length} image service(s) (docker compose)…`);
     mkdirSync(TMP_DIR, { recursive: true });
     const localCompose = path.join(TMP_DIR, "runo-compose.yaml");
     writeFileSync(localCompose, generatedComposeYaml(recipe));
@@ -69,8 +69,8 @@ export async function startServices(
       `docker compose -p runo -f ${shq(REMOTE_COMPOSE)} up -d --remove-orphans`,
       { stream: true, timeoutMs: 10 * 60_000 },
     );
-    if (up.exitCode !== 0) throw new RunoError("docker compose up falhou para os serviços de imagem");
-    // postgres: espera readiness real (o TCP publicado responde antes do banco aceitar queries)
+    if (up.exitCode !== 0) throw new RunoError("docker compose up failed for the image services");
+    // postgres: wait for real readiness (the published TCP port answers before the db accepts queries)
     for (const [name, svc] of imageSvcs) {
       if (svc.image!.startsWith("postgres")) {
         const wait = await provider.exec(
@@ -79,13 +79,13 @@ export async function startServices(
           { timeoutMs: 130_000 },
         );
         if (wait.exitCode !== 0)
-          throw new RunoError(`Postgres do serviço "${name}" não ficou pronto em 120s`);
+          throw new RunoError(`Postgres for service "${name}" did not become ready within 120s`);
       }
     }
   }
 
   for (const [name, svc] of runSvcs) {
-    log.step(`iniciando serviço "${name}" (tmux): ${svc.run}`);
+    log.step(`starting service "${name}" (tmux): ${svc.run}`);
     const envExports = Object.entries(svc.env ?? {})
       .map(([k, v]) => `export ${k}=${shq(v)}; `)
       .join("");
@@ -97,7 +97,7 @@ export async function startServices(
       `tmux new-session -d -s ${tmuxSession(name)} ${shq(wrapped)}`;
     const r = await provider.exec(rt, cmd);
     if (r.exitCode !== 0)
-      throw new RunoError(`Falha ao iniciar o serviço "${name}" via tmux: ${r.stderr.trim()}`);
+      throw new RunoError(`Failed to start service "${name}" via tmux: ${r.stderr.trim()}`);
   }
 
   const publicServices: PublicService[] = Object.entries(recipe.services)
@@ -118,21 +118,21 @@ async function startComposePassthrough(
   const c = recipe.compose!;
   const prefix = composePrefix(recipe);
 
-  // Resolve o compose efetivo NA VM (interpolação usa o .env que subiu junto)
+  // Resolve the effective compose ON the VM (interpolation uses the uploaded .env)
   const cfg = await provider.exec(rt, `${prefix} config --format json`, {
     cwd: remoteDir,
     timeoutMs: 120_000,
   });
   if (cfg.exitCode !== 0)
     throw new RunoError(
-      `docker compose config falhou para ${c.file}`,
+      `docker compose config failed for ${c.file}`,
       cfg.stderr.trim().split("\n").slice(-5).join("\n"),
     );
   let parsed: any;
   try {
     parsed = JSON.parse(cfg.stdout);
   } catch {
-    throw new RunoError(`Saída de docker compose config não é JSON válido (${c.file})`);
+    throw new RunoError(`docker compose config output is not valid JSON (${c.file})`);
   }
 
   const services: Record<string, any> = parsed.services ?? {};
@@ -144,19 +144,19 @@ async function startComposePassthrough(
   let publicName = c.public;
   if (!publicName) {
     publicName = Object.keys(services).find((n) => publishedOf(services[n]).length > 0);
-    if (publicName) log.warn(`recipe sem "public:" — usando "${publicName}" como serviço público`);
+    if (publicName) log.warn(`recipe has no "public:" — using "${publicName}" as the public service`);
   }
   if (!publicName || !services[publicName])
     throw new RunoError(
-      `Serviço público "${c.public ?? "?"}" não existe no compose efetivo (${c.file})`,
-      `Serviços disponíveis: ${Object.keys(services).join(", ")}`,
+      `Public service "${c.public ?? "?"}" does not exist in the effective compose (${c.file})`,
+      `Available services: ${Object.keys(services).join(", ")}`,
     );
   const publicPorts = publishedOf(services[publicName]);
   if (publicPorts.length === 0)
-    throw new RunoError(`Serviço público "${publicName}" não publica nenhuma porta no ${c.file}`);
+    throw new RunoError(`Public service "${publicName}" publishes no ports in ${c.file}`);
   const publicPort = publicPorts[0]!;
 
-  log.step(`subindo compose do repo (${c.file}${c.profiles.length ? `, profiles: ${c.profiles.join(",")}` : ""}) — primeiro up builda imagens e pode demorar…`);
+  log.step(`starting the repo's compose (${c.file}${c.profiles.length ? `, profiles: ${c.profiles.join(",")}` : ""}) — the first up builds images and can take a while…`);
   const up = await provider.exec(rt, `${prefix} up -d`, {
     cwd: remoteDir,
     stream: true,
@@ -164,8 +164,8 @@ async function startComposePassthrough(
   });
   if (up.exitCode !== 0)
     throw new RunoError(
-      `docker compose up falhou (${c.file})`,
-      `Veja os logs: runo logs — ou na VM: ${c.file}`,
+      `docker compose up failed (${c.file})`,
+      `Check the logs: runo logs — or on the VM: ${c.file}`,
     );
 
   const internalPorts = Object.values(services).flatMap((s) => publishedOf(s));
@@ -177,7 +177,7 @@ async function startComposePassthrough(
   };
 }
 
-/** Espera as portas responderem NA VM (via nc local à VM). */
+/** Waits for ports to answer ON the VM (via nc local to the VM). */
 export async function waitInternalPorts(
   provider: RuntimeProvider,
   rt: Runtime,
@@ -192,8 +192,8 @@ export async function waitInternalPorts(
     );
     if (r.exitCode !== 0)
       throw new RunoError(
-        `Porta ${port} não respondeu na VM em 120s`,
-        "Veja os logs do serviço com `runo logs <serviço>`",
+        `Port ${port} did not answer on the VM within 120s`,
+        "Check the service logs with `runo logs <service>`",
       );
   }
 }
@@ -245,8 +245,8 @@ async function httpOk(url: string, timeoutMs = 5000): Promise<boolean> {
 }
 
 /**
- * Sonda rápida: todos os serviços públicos respondem? Usada no resume para
- * detectar volta quente de hibernação (aí não religa nada).
+ * Quick probe: are all public services answering? Used on resume to detect a
+ * hot return from hibernation (in which case nothing gets restarted).
  */
 export async function probeServices(
   rt: Runtime,
@@ -269,8 +269,8 @@ export async function probeServices(
 }
 
 /**
- * Healthcheck executado DE FORA (do laptop) — valida SG + serviço de uma vez
- * (decisão 12). Timeout 120s por serviço; falha derruba o up.
+ * Health check executed FROM OUTSIDE (the laptop) — validates SG + service in
+ * one shot. Per-service timeout (default 120s); failure fails the up.
  */
 export async function healthcheckPublic(
   provider: RuntimeProvider,
@@ -284,7 +284,7 @@ export async function healthcheckPublic(
     const target = svc.health
       ? `http://${rt.ip}:${svc.port}${svc.health.startsWith("/") ? svc.health : `/${svc.health}`}`
       : `${rt.ip}:${svc.port} (TCP)`;
-    log.step(`healthcheck externo de "${svc.name}" → ${target} (timeout ${timeoutSec}s)`);
+    log.step(`external health check for "${svc.name}" → ${target} (timeout ${timeoutSec}s)`);
     const deadline = Date.now() + timeoutSec * 1000;
     let ok = false;
     while (Date.now() < deadline && !ok) {
@@ -296,11 +296,11 @@ export async function healthcheckPublic(
     if (!ok) {
       const tail = await serviceLogTail(provider, rt, recipe, remoteDir, svc.name);
       throw new RunoError(
-        `Healthcheck de "${svc.name}" falhou após ${timeoutSec}s (${target})`,
-        tail ? `Últimas linhas do log:\n${tail}` : "Veja `runo logs`",
+        `Health check for "${svc.name}" failed after ${timeoutSec}s (${target})`,
+        tail ? `Last log lines:\n${tail}` : "See `runo logs`",
       );
     }
-    log.ok(`"${svc.name}" respondendo em http://${rt.ip}:${svc.port}`);
+    log.ok(`"${svc.name}" answering at http://${rt.ip}:${svc.port}`);
   }
 }
 

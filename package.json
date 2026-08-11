@@ -1,7 +1,7 @@
 {
   "name": "@kodus/runo",
   "version": "0.1.0",
-  "description": "runo \u2014 ambiente remoto por branch (AWS EC2) para devs e agentes de c\u00f3digo",
+  "description": "runo \u2014 one remote environment per branch (AWS EC2) for devs and coding agents",
   "type": "module",
   "bin": {
     "runo": "bin/runo.ts"

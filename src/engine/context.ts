@@ -21,12 +21,12 @@ export function repoTop(cwd: string): string | null {
 export function currentBranch(repoPath: string): string {
   const r = git(repoPath, "branch", "--show-current");
   if (r.exitCode !== 0 || !r.stdout)
-    throw new RunoError(`Não consegui detectar a branch atual em ${repoPath}`);
+    throw new RunoError(`Could not detect the current branch in ${repoPath}`);
   return r.stdout;
 }
 
 export interface EnvContext {
-  repoPath: string; // repo original (âncora do worktree)
+  repoPath: string; // original repo (worktree anchor)
   repoName: string;
   branch: string;
   slug: string;
@@ -40,13 +40,13 @@ export function worktreePathFor(repoName: string, slug: string): string {
   return path.join(WORKTREES_DIR, `${repoName}-${slug}`);
 }
 
-/** Monta o contexto de um env a partir do repo original + branch. */
+/** Builds an env context from the original repo + branch. */
 export function buildContext(repoPath: string, branch: string): EnvContext {
   const repoName = path.basename(repoPath);
   const slug = slugify(branch);
   const worktree = worktreePathFor(repoName, slug);
-  // recipe: worktree primeiro (se já existir), senão o repo original —
-  // cobre recipe untracked (caso kodus-ai)
+  // recipe: worktree first (if it already exists), then the original repo —
+  // covers untracked recipes
   const { recipe, path: recipePath } = loadRecipe(worktree, repoPath);
   return { repoPath, repoName, branch, slug, envName: envNameFor(slug), worktree, recipe, recipePath };
 }
@@ -66,8 +66,8 @@ export function contextFromEnv(env: EnvRecord): EnvContext {
 }
 
 /**
- * Resolve qual env o comando alvo: cwd dentro de um worktree do runo >
- * repo+branch do cwd > --branch no repo do cwd.
+ * Resolves which env a command targets: cwd inside a runo worktree >
+ * cwd's repo+branch > --branch within the cwd's repo.
  */
 export function resolveEnv(opts: { branch?: string } = {}): EnvRecord {
   const cwd = process.cwd();
@@ -83,13 +83,13 @@ export function resolveEnv(opts: { branch?: string } = {}): EnvRecord {
     if (found) return found;
     if (byWorktree) return byWorktree;
     throw new RunoError(
-      `Nenhum ambiente registrado para ${path.basename(top)} @ ${branch}`,
-      "Crie com `runo new <nome>` (ou veja os envs existentes com `runo ls`)",
+      `No environment registered for ${path.basename(top)} @ ${branch}`,
+      "Create one with `runo new <name>` (or list existing envs with `runo ls`)",
     );
   }
   if (byWorktree) return byWorktree;
   throw new RunoError(
-    "Fora de um repositório git e de qualquer worktree do runo",
-    "Rode dentro do repo do projeto ou de um worktree criado pelo runo (`runo ls` mostra os paths)",
+    "Outside a git repository and any runo worktree",
+    "Run inside the project repo or a runo-created worktree (`runo ls` shows the paths)",
   );
 }

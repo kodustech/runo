@@ -16,9 +16,9 @@ export interface ServiceDef {
 export interface ComposeDef {
   file: string;
   profiles: string[];
-  public?: string; // nome do serviço cuja porta publicada vira a URL pública
-  health?: string; // path HTTP no serviço público
-  healthTimeoutSec?: number; // yaml: health_timeout (default 120; apps pesados no 1º boot precisam de mais)
+  public?: string; // service whose published port becomes the public URL
+  health?: string; // HTTP path on the public service
+  healthTimeoutSec?: number; // yaml: health_timeout (default 120; heavy apps need more on first boot)
 }
 
 export interface NormalizedRecipe {
@@ -40,18 +40,18 @@ export function parseRecipe(yamlText: string, source: string): NormalizedRecipe 
   try {
     raw = parse(yamlText);
   } catch (e: any) {
-    throw new RunoError(`Recipe inválida (${source}): YAML não parseia — ${e.message}`);
+    throw new RunoError(`Invalid recipe (${source}): YAML does not parse — ${e.message}`);
   }
   if (!raw || typeof raw !== "object")
-    throw new RunoError(`Recipe inválida (${source}): arquivo vazio ou não é um mapa YAML`);
+    throw new RunoError(`Invalid recipe (${source}): file is empty or not a YAML map`);
   if (raw.version !== 1)
     throw new RunoError(
-      `Recipe inválida (${source}): "version: ${raw.version}" não suportada`,
-      "Este runo suporta apenas version: 1",
+      `Invalid recipe (${source}): "version: ${raw.version}" is not supported`,
+      "This runo only supports version: 1",
     );
   const services = raw.services;
   if (!services || typeof services !== "object" || Object.keys(services).length === 0)
-    throw new RunoError(`Recipe inválida (${source}): seção "services" ausente ou vazia`);
+    throw new RunoError(`Invalid recipe (${source}): "services" section missing or empty`);
 
   const setup: string[] = Array.isArray(raw.setup) ? raw.setup.map(String) : [];
   const filesCopy: string[] = Array.isArray(raw.files?.copy) ? raw.files.copy.map(String) : [];
@@ -62,16 +62,16 @@ export function parseRecipe(yamlText: string, source: string): NormalizedRecipe 
   const validate: { name: string; run: string }[] = [];
   for (const v of Array.isArray(raw.validate) ? raw.validate : []) {
     if (!v?.name || !v?.run)
-      throw new RunoError(`Recipe inválida (${source}): cada item de "validate" precisa de name + run`);
+      throw new RunoError(`Invalid recipe (${source}): every "validate" item needs name + run`);
     validate.push({ name: String(v.name), run: String(v.run) });
   }
 
   const diskRaw = String(raw.limits?.disk ?? "30gb");
   const diskMatch = diskRaw.match(/^(\d+)\s*gb$/i);
   if (!diskMatch)
-    throw new RunoError(`Recipe inválida (${source}): limits.disk "${diskRaw}" — use ex.: "30gb"`);
+    throw new RunoError(`Invalid recipe (${source}): limits.disk "${diskRaw}" — use e.g. "30gb"`);
 
-  // idle_suspend: "10m" | "2h" | "90s" | "off" (default 10m — PLAN §3.3)
+  // idle_suspend: "10m" | "2h" | "90s" | "off" (default 10m)
   const idleRaw = String(raw.limits?.idle_suspend ?? "10m").toLowerCase();
   let idleSuspendSec: number;
   if (idleRaw === "off" || idleRaw === "0") idleSuspendSec = 0;
@@ -79,7 +79,7 @@ export function parseRecipe(yamlText: string, source: string): NormalizedRecipe 
     const m = idleRaw.match(/^(\d+)\s*(s|m|h)$/);
     if (!m)
       throw new RunoError(
-        `Recipe inválida (${source}): limits.idle_suspend "${idleRaw}" — use ex.: "10m", "2h" ou "off"`,
+        `Invalid recipe (${source}): limits.idle_suspend "${idleRaw}" — use e.g. "10m", "2h" or "off"`,
       );
     idleSuspendSec = Number(m[1]) * (m[2] === "h" ? 3600 : m[2] === "m" ? 60 : 1);
   }
@@ -88,19 +88,19 @@ export function parseRecipe(yamlText: string, source: string): NormalizedRecipe 
     instance: String(raw.limits?.instance ?? "t3.medium"),
     diskGb: Number(diskMatch[1]),
     idleSuspendSec,
-    spot: raw.limits?.spot === true, // ~70% mais barato; interrupção vira "stop" (= suspend)
+    spot: raw.limits?.spot === true, // ~70% cheaper; interruption becomes "stop" (= suspend)
   };
 
-  // Modo passthrough: services.compose é mutuamente exclusivo com image:/run:
+  // Passthrough mode: services.compose is mutually exclusive with image:/run:
   if ("compose" in services) {
     const others = Object.keys(services).filter((k) => k !== "compose");
     if (others.length > 0)
       throw new RunoError(
-        `Recipe inválida (${source}): "services.compose" é mutuamente exclusivo com outros serviços (encontrado: ${others.join(", ")})`,
+        `Invalid recipe (${source}): "services.compose" is mutually exclusive with other services (found: ${others.join(", ")})`,
       );
     const c = services.compose;
     if (!c?.file)
-      throw new RunoError(`Recipe inválida (${source}): services.compose.file é obrigatório`);
+      throw new RunoError(`Invalid recipe (${source}): services.compose.file is required`);
     return {
       version: 1,
       setup,
@@ -126,7 +126,7 @@ export function parseRecipe(yamlText: string, source: string): NormalizedRecipe 
     const hasRun = typeof def?.run === "string";
     if (hasImage === hasRun)
       throw new RunoError(
-        `Recipe inválida (${source}): serviço "${name}" precisa de exatamente um de "image" ou "run"`,
+        `Invalid recipe (${source}): service "${name}" needs exactly one of "image" or "run"`,
       );
     const svc: ServiceDef = {
       image: hasImage ? String(def.image) : undefined,
@@ -140,23 +140,23 @@ export function parseRecipe(yamlText: string, source: string): NormalizedRecipe 
       healthTimeoutSec: def.health_timeout !== undefined ? Number(def.health_timeout) : undefined,
     };
     if (svc.public && !svc.port)
-      throw new RunoError(`Recipe inválida (${source}): serviço público "${name}" precisa de "port"`);
+      throw new RunoError(`Invalid recipe (${source}): public service "${name}" needs "port"`);
     if (svc.health && !svc.port)
-      throw new RunoError(`Recipe inválida (${source}): "health" no serviço "${name}" exige "port"`);
+      throw new RunoError(`Invalid recipe (${source}): "health" on service "${name}" requires "port"`);
     normalized[name] = svc;
   }
 
   return { version: 1, setup, filesCopy, mode: "services", services: normalized, data, validate, limits };
 }
 
-/** Carrega a recipe do primeiro diretório que tiver .kodus/workspace.yaml. */
+/** Loads the recipe from the first directory that has .kodus/workspace.yaml. */
 export function loadRecipe(...dirs: string[]): { recipe: NormalizedRecipe; path: string } {
   for (const dir of dirs) {
     const p = path.join(dir, RECIPE_REL_PATH);
     if (existsSync(p)) return { recipe: parseRecipe(readFileSync(p, "utf8"), p), path: p };
   }
   throw new RunoError(
-    `Nenhuma recipe encontrada (${RECIPE_REL_PATH}) em: ${dirs.join(", ")}`,
-    "Rode `runo init` na raiz do repo para gerar uma proposta",
+    `No recipe found (${RECIPE_REL_PATH}) in: ${dirs.join(", ")}`,
+    "Run `runo init` at the repo root to generate a proposal",
   );
 }

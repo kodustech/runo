@@ -3,8 +3,8 @@ import path from "node:path";
 import { parse, stringify } from "yaml";
 
 /**
- * Inferência do `runo init`: inspeciona o repo e propõe .kodus/workspace.yaml.
- * Heurísticas simples e transparentes — o dev revisa antes do primeiro up.
+ * `runo init` inference: inspects the repo and proposes .kodus/workspace.yaml.
+ * Simple, transparent heuristics — the dev reviews before the first up.
  */
 
 const COMPOSE_CANDIDATES = [
@@ -16,7 +16,7 @@ const COMPOSE_CANDIDATES = [
   "compose.yaml",
 ];
 
-// suites mais baratas primeiro — a suite completa costuma ser pesada demais pro loop
+// cheaper suites first — the full suite is usually too heavy for the loop
 const TEST_PREFERENCE = ["test:unit", "test:rbac", "test:fast", "test:quick", "test"];
 const MIGRATE_PREFERENCE = ["migration:run", "db:migrate", "migrate:run", "migrate"];
 const SEED_PREFERENCE = ["db:seed", "seed"];
@@ -44,7 +44,7 @@ export function inferRecipe(repoPath: string): { yaml: string; notes: string[] }
   try {
     scripts = JSON.parse(readFileSync(path.join(repoPath, "package.json"), "utf8")).scripts ?? {};
   } catch {
-    notes.push("package.json ausente/ilegível — recipe mínima proposta, revise à mão");
+    notes.push("package.json missing/unreadable — minimal recipe proposed, review by hand");
   }
 
   const runScript = (name: string) => `${pm} run ${name}`;
@@ -56,12 +56,12 @@ export function inferRecipe(repoPath: string): { yaml: string; notes: string[] }
   let heavy = false;
 
   if (composeFile) {
-    // ---- modo passthrough: o compose do repo roda como está na VM ----
+    // ---- passthrough mode: the repo's compose runs as-is on the VM ----
     let composeDoc: any = {};
     try {
       composeDoc = parse(readFileSync(path.join(repoPath, composeFile), "utf8")) ?? {};
     } catch {
-      notes.push(`${composeFile} não parseou — passthrough proposto sem inspeção de serviços`);
+      notes.push(`${composeFile} did not parse — passthrough proposed without service inspection`);
     }
     const services: Record<string, any> = composeDoc.services ?? {};
     const names = Object.keys(services);
@@ -70,14 +70,14 @@ export function inferRecipe(repoPath: string): { yaml: string; notes: string[] }
     const allProfiles = new Set<string>();
     for (const s of Object.values(services))
       for (const p of (s as any)?.profiles ?? []) allProfiles.add(p);
-    // preferimos um profile "local*" (ex.: local-db); sem ele, os serviços
-    // profile-less do compose já são o ambiente default
+    // prefer a "local*" profile (e.g. local-db); without one, the compose's
+    // profile-less services are already the default environment
     const profile =
       [...allProfiles].find((p) => p === "local-db") ??
       [...allProfiles].find((p) => p.includes("local"));
     if (!profile && allProfiles.size > 0)
       notes.push(
-        `compose tem profiles (${[...allProfiles].join(", ")}) mas nenhum "local*" — subindo só os serviços default`,
+        `compose has profiles (${[...allProfiles].join(", ")}) but no "local*" one — starting only the default services`,
       );
 
     const activeNames = names.filter((n) => {
@@ -89,7 +89,7 @@ export function inferRecipe(repoPath: string): { yaml: string; notes: string[] }
       activeNames.find((n) => n.includes("api") && hasPorts(n)) ??
       activeNames.find((n) => hasPorts(n) && services[n]?.build) ??
       activeNames.find(hasPorts);
-    if (!publicSvc) notes.push("nenhum serviço com porta publicada — defina `public:` à mão");
+    if (!publicSvc) notes.push("no service publishes a port — set `public:` by hand");
 
     doc.services = {
       compose: {
@@ -99,11 +99,11 @@ export function inferRecipe(repoPath: string): { yaml: string; notes: string[] }
       },
     };
   } else {
-    // ---- modo services: app roda direto na VM ----
+    // ---- services mode: the app runs directly on the VM ----
     const dev = ["dev", "start:dev", "serve", "start"].find((s) => scripts[s]);
-    const app: any = { run: dev ? runScript(dev) : "echo 'defina o comando do app'", port: 3000, public: true };
-    if (!dev) notes.push("nenhum script dev/start — defina services.app.run à mão");
-    notes.push("porta 3000 assumida — ajuste services.app.port se o app usa outra");
+    const app: any = { run: dev ? runScript(dev) : "echo 'set your app command'", port: 3000, public: true };
+    if (!dev) notes.push("no dev/start script — set services.app.run by hand");
+    notes.push("port 3000 assumed — adjust services.app.port if the app uses another one");
     doc.services = { app };
     let deps: Record<string, string> = {};
     try {
@@ -137,10 +137,10 @@ export function inferRecipe(repoPath: string): { yaml: string; notes: string[] }
   doc.limits = heavy
     ? { instance: "t3.xlarge", disk: "100gb" }
     : { instance: "t3.medium", disk: "30gb" };
-  if (heavy) notes.push("repo pesado (monorepo/compose grande) — t3.xlarge + 100gb propostos");
+  if (heavy) notes.push("heavy repo (monorepo/large compose) — t3.xlarge + 100gb proposed");
 
   const header =
-    "# Gerado por `runo init` — revise antes do primeiro `runo up`.\n" +
-    "# Docs do schema: https://github.com/kodustech/runo\n";
+    "# Generated by `runo init` — review before the first `runo up`.\n" +
+    "# Schema docs: https://github.com/kodustech/runo\n";
   return { yaml: header + stringify(doc), notes };
 }

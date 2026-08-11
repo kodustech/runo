@@ -13,7 +13,7 @@ export interface ExecResult {
   stderr: string;
 }
 
-/** Escapa para uso como argumento único em shell POSIX. */
+/** Escapes a string for use as a single POSIX shell argument. */
 export function shq(s: string): string {
   return `'${s.replaceAll("'", `'\\''`)}'`;
 }
@@ -58,7 +58,7 @@ export async function sshExec(
   return { exitCode: timedOut ? 124 : exitCode, stdout, stderr };
 }
 
-/** Sessão com stdio herdado (agente interativo, logs -f, exec). TTY se o terminal local for TTY. */
+/** Session with inherited stdio (interactive agent, logs -f, exec). TTY when the local terminal is a TTY. */
 export async function sshInteractive(t: SshTarget, command: string): Promise<number> {
   const tty = process.stdin.isTTY === true;
   const cmd = ["ssh", ...(tty ? ["-t"] : []), ...sshBaseArgs(t), `${t.user}@${t.ip}`, command];
@@ -77,7 +77,7 @@ export async function scpUpload(t: SshTarget, localPath: string, remotePath: str
   return { exitCode, stdout, stderr };
 }
 
-/** rsync local→remoto (runo push: worktree → VM). */
+/** rsync local→remote (runo push: worktree → VM). */
 export async function rsyncPush(
   t: SshTarget,
   localPath: string,
@@ -102,7 +102,7 @@ export async function rsyncPush(
   return { exitCode, stdout, stderr };
 }
 
-/** rsync remoto→local (runo pull, download de evidência). */
+/** rsync remote→local (runo pull, evidence download). */
 export async function rsyncPull(
   t: SshTarget,
   remotePath: string,

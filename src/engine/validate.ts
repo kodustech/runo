@@ -32,28 +32,28 @@ export interface Evidence {
 }
 
 /**
- * Roda os steps de validate NA VM e baixa a evidência (JSON + MD) para o
- * worktree local — contrato futuro com a Kody.
+ * Runs the validate steps ON the VM and downloads the evidence (JSON + MD)
+ * into the local worktree — the future contract with Kody.
  */
 export async function validateEnv(ctx: EnvContext, onlyStep?: string): Promise<Evidence> {
   const provider = getProvider("aws");
   const env = registry.get(ctx.envName);
-  if (!env) throw new RunoError(`Ambiente ${ctx.envName} não registrado`, "Crie com `runo new`/`runo up`");
+  if (!env) throw new RunoError(`Environment ${ctx.envName} is not registered`, "Create it with `runo new`/`runo up`");
   const rt = await provider.status(env.runtime as unknown as Runtime);
   if (rt.state !== "running" || !rt.ip)
-    throw new RunoError(`Ambiente ${ctx.envName} não está rodando (${rt.state})`, "Rode `runo up`/`runo resume`");
+    throw new RunoError(`Environment ${ctx.envName} is not running (${rt.state})`, "Run `runo up`/`runo resume`");
 
   let steps = ctx.recipe.validate;
   if (onlyStep) {
     steps = steps.filter((s) => s.name === onlyStep);
     if (steps.length === 0)
       throw new RunoError(
-        `Step "${onlyStep}" não existe na recipe`,
-        `Steps disponíveis: ${ctx.recipe.validate.map((s) => s.name).join(", ") || "(nenhum)"}`,
+        `Step "${onlyStep}" does not exist in the recipe`,
+        `Available steps: ${ctx.recipe.validate.map((s) => s.name).join(", ") || "(none)"}`,
       );
   }
   if (steps.length === 0)
-    throw new RunoError("Recipe sem steps de validate", "Adicione uma seção `validate:` na recipe");
+    throw new RunoError("Recipe has no validate steps", "Add a `validate:` section to the recipe");
 
   const remoteDir = remoteRepoDir(ctx.repoName);
   const shaRes = await provider.exec(rt, "git rev-parse --short HEAD", { cwd: remoteDir });
@@ -66,7 +66,7 @@ export async function validateEnv(ctx: EnvContext, onlyStep?: string): Promise<E
   for (const step of steps) {
     const logRel = `.kodus/evidence/logs/${sha}-${step.name}.log`;
     const remoteLog = `${REMOTE_RUNO_DIR}/evidence/logs/${sha}-${step.name}.log`;
-    log.step(`validate[${step.name}]: ${step.run} (na VM)`);
+    log.step(`validate[${step.name}]: ${step.run} (on the VM)`);
     const t0 = Date.now();
     const r = await provider.exec(rt, `{ ${step.run} ; } > ${shq(remoteLog)} 2>&1`, {
       cwd: remoteDir,
@@ -94,25 +94,25 @@ export async function validateEnv(ctx: EnvContext, onlyStep?: string): Promise<E
     urls: urlsFor(env, rt.ip),
   };
 
-  // baixa logs + escreve JSON/MD no worktree local
+  // download logs + write JSON/MD into the local worktree
   const evidenceDir = path.join(ctx.worktree, ".kodus", "evidence");
   mkdirSync(path.join(evidenceDir, "logs"), { recursive: true });
   await provider.download(rt, `${REMOTE_RUNO_DIR}/evidence/logs/${sha}-*.log`, path.join(evidenceDir, "logs/"));
   writeFileSync(path.join(evidenceDir, `${sha}.json`), JSON.stringify(evidence, null, 2) + "\n");
   writeFileSync(path.join(evidenceDir, `${sha}.md`), renderMarkdown(evidence));
-  log.ok(`evidência: ${path.join(evidenceDir, `${sha}.json`)} (+ .md, + logs/)`);
+  log.ok(`evidence: ${path.join(evidenceDir, `${sha}.json`)} (+ .md, + logs/)`);
   return evidence;
 }
 
 function renderMarkdown(e: Evidence): string {
   const icon = (s: string) => (s === "passed" ? "✅" : "❌");
   const lines = [
-    `${icon(e.status)} **Kodus — validação do ambiente \`${e.env}\` (commit ${e.sha})**`,
+    `${icon(e.status)} **runo — environment validation \`${e.env}\` (commit ${e.sha})**`,
     "",
     `- Repo: \`${e.repo}\` · Branch: \`${e.branch}\``,
-    `- Início: ${e.startedAt} · Fim: ${e.finishedAt}`,
+    `- Started: ${e.startedAt} · Finished: ${e.finishedAt}`,
     "",
-    "| Step | Status | Duração | Exit | Log |",
+    "| Step | Status | Duration | Exit | Log |",
     "| --- | --- | --- | --- | --- |",
     ...e.steps.map(
       (s) =>

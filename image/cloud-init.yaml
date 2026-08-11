@@ -1,14 +1,14 @@
 #cloud-config
-# Provisionamento das VMs do runo (Ubuntu 24.04 LTS).
-# O `runo up` espera `cloud-init status --wait` antes de qualquer setup.
+# Provisioning for runo VMs (Ubuntu 24.04 LTS).
+# `runo up` waits for `cloud-init status --wait` before any setup.
 package_update: true
 
 write_files:
-  # Auto-suspend por inatividade: a VM se desliga sozinha (shutdown => EC2
-  # "stopped", que é o runo suspend — EBS intacto, runo resume religa).
-  # Atividade = SSH estabelecido | load >= 0.20 | tráfego de rede | CPU dos
-  # agentes (claude/codex). Limite em segundos em /etc/runo/idle-limit
-  # (escrito pelo runo up a partir de limits.idle_suspend; 0 = desligado).
+  # Idle auto-suspend: the VM shuts itself down (shutdown => EC2 "stopped",
+  # which is runo suspend — EBS intact, runo resume brings it back).
+  # Activity = established SSH | load >= 0.20 | network traffic | agent CPU
+  # (claude/codex). Limit in seconds at /etc/runo/idle-limit (written by
+  # runo up from limits.idle_suspend; 0 = disabled).
   - path: /usr/local/bin/runo-idle-check
     permissions: "0755"
     content: |
@@ -42,7 +42,7 @@ write_files:
       fi
       last=$(cat "$STATE/last-active")
       if [ $((now - last)) -ge "$LIMIT" ]; then
-        logger -t runo "auto-suspend: $((now - last))s ocioso (limite ${LIMIT}s)"
+        logger -t runo "auto-suspend: idle for $((now - last))s (limit ${LIMIT}s)"
         systemctl poweroff
       fi
   - path: /etc/cron.d/runo-idle
@@ -61,7 +61,7 @@ packages:
   - docker.io
   - docker-compose-v2
   - docker-buildx
-  # hibernação EC2 (RAM → EBS no suspend; resume volta com serviços quentes)
+  # EC2 hibernation (RAM → EBS on suspend; resume comes back with services hot)
   - ec2-hibinit-agent
 
 runcmd:
@@ -70,17 +70,17 @@ runcmd:
   # Node 22 (NodeSource)
   - curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
   - apt-get install -y nodejs
-  # pnpm + CLIs dos agentes de código
+  # pnpm + coding agent CLIs
   - npm install -g pnpm @anthropic-ai/claude-code @openai/codex
-  # bun para o usuário ubuntu
+  # bun for the ubuntu user
   - su - ubuntu -c 'curl -fsSL https://bun.sh/install | bash'
   - echo 'export PATH=/home/ubuntu/.bun/bin:$PATH' > /etc/profile.d/runo-path.sh
-  # git utilizável pelo agente na VM
+  # git usable by the agent on the VM
   - git config --system user.name runo
   - git config --system user.email runo@kodus.local
   - git config --system init.defaultBranch main
   - git config --system --add safe.directory '*'
-  # estado do runo na VM
+  # runo state on the VM
   - mkdir -p /home/ubuntu/.runo/logs /home/ubuntu/.runo/evidence/logs
   - chown -R ubuntu:ubuntu /home/ubuntu/.runo
   - mkdir -p /etc/runo

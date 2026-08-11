@@ -4,8 +4,8 @@ import { RunoError } from "../errors";
 import { git } from "./context";
 
 /**
- * Garante o worktree local do env (decisão 9): âncora de sync — origem do
- * upload, destino do `runo pull`.
+ * Ensures the env's local worktree: the sync anchor — upload source,
+ * `runo pull` destination.
  */
 export function ensureWorktree(
   repoPath: string,
@@ -22,17 +22,17 @@ export function ensureWorktree(
   if (r.exitCode !== 0) {
     if (/already checked out/i.test(r.stderr))
       throw new RunoError(
-        `A branch "${branch}" já está checked out no working tree principal (${repoPath})`,
-        "Use `runo new <nome>` para criar uma task branch dedicada — o runo trabalha em worktrees próprios para não disputar o seu checkout",
+        `Branch "${branch}" is already checked out in the main working tree (${repoPath})`,
+        "Use `runo new <name>` to create a dedicated task branch — runo works in its own worktrees so it never fights your checkout",
       );
     if (/already exists/i.test(r.stderr) && opts.createBranch)
       throw new RunoError(
-        `A branch "${branch}" já existe`,
-        `Se quer um env para ela: runo up --branch ${branch}`,
+        `Branch "${branch}" already exists`,
+        `If you want an env for it: runo up --branch ${branch}`,
       );
     if (/invalid reference|not a valid ref/i.test(r.stderr))
-      throw new RunoError(`Branch "${branch}" não existe em ${repoPath}`, "Crie com `runo new <nome>`");
-    throw new RunoError(`git worktree add falhou: ${r.stderr}`);
+      throw new RunoError(`Branch "${branch}" does not exist in ${repoPath}`, "Create it with `runo new <name>`");
+    throw new RunoError(`git worktree add failed: ${r.stderr}`);
   }
   return dest;
 }
