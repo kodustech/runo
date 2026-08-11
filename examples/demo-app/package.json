@@ -1,0 +1,12 @@
+{
+  "name": "demo-app",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun run src/server.ts",
+    "lint": "bun run scripts/lint.ts",
+    "test": "bun test",
+    "db:migrate": "bun run scripts/migrate.ts",
+    "db:seed": "bun run scripts/seed.ts"
+  }
+}

@@ -1,0 +1,86 @@
+#cloud-config
+# Provisionamento das VMs do runo (Ubuntu 24.04 LTS).
+# O `runo up` espera `cloud-init status --wait` antes de qualquer setup.
+package_update: true
+
+write_files:
+  # Auto-suspend por inatividade: a VM se desliga sozinha (shutdown => EC2
+  # "stopped", que é o runo suspend — EBS intacto, runo resume religa).
+  # Atividade = SSH estabelecido | load >= 0.20 | tráfego de rede | CPU dos
+  # agentes (claude/codex). Limite em segundos em /etc/runo/idle-limit
+  # (escrito pelo runo up a partir de limits.idle_suspend; 0 = desligado).
+  - path: /usr/local/bin/runo-idle-check
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -u
+      LIMIT=$(cat /etc/runo/idle-limit 2>/dev/null || echo 600)
+      case "$LIMIT" in (*[!0-9]*|"") exit 0;; esac
+      [ "$LIMIT" -le 0 ] && exit 0
+      STATE=/run/runo-idle; mkdir -p "$STATE"
+      now=$(date +%s); active=""
+      ss -Htn state established '( sport = :22 )' 2>/dev/null | grep -q . && active=ssh
+      if [ -z "$active" ]; then
+        awk '{ exit ($1 >= 0.20) ? 0 : 1 }' /proc/loadavg && active=load
+      fi
+      if [ -z "$active" ]; then
+        bytes=$(awk -F'[: ]+' 'NR>2 && $2 != "lo" { rx+=$3; tx+=$11 } END { printf "%d", rx+tx }' /proc/net/dev)
+        prev=$(cat "$STATE/netbytes" 2>/dev/null || echo 0)
+        echo "$bytes" > "$STATE/netbytes"
+        [ $((bytes - prev)) -gt 102400 ] && active=net
+      fi
+      if [ -z "$active" ]; then
+        for pid in $(pgrep -x claude; pgrep -x codex); do
+          t=$(awk '{ print $14+$15 }' "/proc/$pid/stat" 2>/dev/null) || continue
+          prev=$(cat "$STATE/agent-$pid" 2>/dev/null || echo -1)
+          echo "$t" > "$STATE/agent-$pid"
+          if [ "$t" != "$prev" ]; then active=agent; break; fi
+        done
+      fi
+      if [ -n "$active" ] || [ ! -f "$STATE/last-active" ]; then
+        echo "$now" > "$STATE/last-active"; exit 0
+      fi
+      last=$(cat "$STATE/last-active")
+      if [ $((now - last)) -ge "$LIMIT" ]; then
+        logger -t runo "auto-suspend: $((now - last))s ocioso (limite ${LIMIT}s)"
+        systemctl poweroff
+      fi
+  - path: /etc/cron.d/runo-idle
+    permissions: "0644"
+    content: |
+      * * * * * root /usr/local/bin/runo-idle-check
+
+packages:
+  - git
+  - tmux
+  - rsync
+  - curl
+  - ca-certificates
+  - unzip
+  - netcat-openbsd
+  - docker.io
+  - docker-compose-v2
+  - docker-buildx
+  # hibernação EC2 (RAM → EBS no suspend; resume volta com serviços quentes)
+  - ec2-hibinit-agent
+
+runcmd:
+  - systemctl enable --now docker
+  - usermod -aG docker ubuntu
+  # Node 22 (NodeSource)
+  - curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+  - apt-get install -y nodejs
+  # pnpm + CLIs dos agentes de código
+  - npm install -g pnpm @anthropic-ai/claude-code @openai/codex
+  # bun para o usuário ubuntu
+  - su - ubuntu -c 'curl -fsSL https://bun.sh/install | bash'
+  - echo 'export PATH=/home/ubuntu/.bun/bin:$PATH' > /etc/profile.d/runo-path.sh
+  # git utilizável pelo agente na VM
+  - git config --system user.name runo
+  - git config --system user.email runo@kodus.local
+  - git config --system init.defaultBranch main
+  - git config --system --add safe.directory '*'
+  # estado do runo na VM
+  - mkdir -p /home/ubuntu/.runo/logs /home/ubuntu/.runo/evidence/logs
+  - chown -R ubuntu:ubuntu /home/ubuntu/.runo
+  - mkdir -p /etc/runo

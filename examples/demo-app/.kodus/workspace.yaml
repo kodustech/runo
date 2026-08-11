@@ -1,0 +1,24 @@
+version: 1
+setup:
+  - bun install
+services:
+  db:
+    image: postgres:16
+    port: 5432
+    env: { POSTGRES_PASSWORD: kd }
+  api:
+    run: bun run dev
+    port: 3000
+    public: true
+    health: /health
+data:
+  migrate: bun run db:migrate
+  seed: bun run db:seed
+validate:
+  - name: lint
+    run: bun run lint
+  - name: test
+    run: bun test
+limits:
+  instance: t3.medium
+  disk: 30gb
