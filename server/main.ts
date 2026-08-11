@@ -217,6 +217,11 @@ const server = Bun.serve<TtyData, {}>({
   idleTimeout: 0,
   async fetch(req, srv) {
     const url = new URL(req.url);
+    // web panel: static page, data itself still requires the token
+    if ((url.pathname === "/" || url.pathname === "/index.html") && req.method === "GET") {
+      const html = readFileSync(new URL("./panel.html", import.meta.url).pathname, "utf8");
+      return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
+    }
     if (url.pathname === "/v1/health" && req.method === "GET") {
       const user = authUser(req, url);
       if (!user) return json({ error: { message: "unauthorized" } }, 401);
@@ -232,7 +237,22 @@ const server = Bun.serve<TtyData, {}>({
         return await handleExec(user, await req.json());
       if (url.pathname === "/v1/upload" && req.method === "POST") return await handleUpload(req, url);
       if (url.pathname === "/v1/download" && req.method === "POST") return await handleDownload(req);
-      if (url.pathname === "/v1/envs" && req.method === "GET") return json({ result: Object.values(loadEnvs()) });
+      if (url.pathname === "/v1/envs" && req.method === "GET") {
+        const envs = Object.values(loadEnvs());
+        if (url.searchParams.get("live") !== "1") return json({ result: envs });
+        // enrich with live instance state for the panel
+        const live = await Promise.all(
+          envs.map(async (e) => {
+            try {
+              const rt = await provider.status({ id: e.instanceId, ip: null, state: "unknown" });
+              return { ...e, state: rt.state, ip: rt.ip };
+            } catch {
+              return { ...e, state: "unknown", ip: null };
+            }
+          }),
+        );
+        return json({ result: live });
+      }
       if (url.pathname === "/v1/tty") {
         const rt = JSON.parse(url.searchParams.get("rt")!) as Runtime;
         const command = Buffer.from(url.searchParams.get("cmd")!, "base64").toString();

@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>runo — environments</title>
+<style>
+  :root { --bg:#0b0e14; --card:#11151f; --line:#1f2633; --tx:#d7dde8; --dim:#8b94a7;
+          --ok:#4ade80; --warn:#fbbf24; --bad:#f87171; --acc:#7aa2f7; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--tx);
+         font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .wrap { max-width:980px; margin:0 auto; padding:32px 20px; }
+  h1 { font-size:16px; font-weight:600; margin:0 0 4px; }
+  h1 .dot { color:var(--acc); }
+  .sub { color:var(--dim); margin:0 0 24px; font-size:12px; }
+  .bar { display:flex; gap:8px; margin-bottom:16px; }
+  input { flex:1; background:var(--card); border:1px solid var(--line); color:var(--tx);
+          padding:8px 10px; border-radius:6px; font:inherit; }
+  button { background:var(--card); border:1px solid var(--line); color:var(--tx);
+           padding:8px 14px; border-radius:6px; font:inherit; cursor:pointer; }
+  button:hover { border-color:var(--acc); }
+  button.danger:hover { border-color:var(--bad); color:var(--bad); }
+  .tablebox { background:var(--card); border:1px solid var(--line); border-radius:8px;
+              overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; min-width:760px; }
+  th, td { text-align:left; padding:9px 12px; border-bottom:1px solid var(--line);
+           white-space:nowrap; }
+  th { color:var(--dim); font-weight:500; font-size:12px; }
+  tr:last-child td { border-bottom:none; }
+  .state { display:inline-block; padding:1px 8px; border-radius:10px; font-size:12px; }
+  .running { color:var(--ok); border:1px solid var(--ok); }
+  .stopped { color:var(--warn); border:1px solid var(--warn); }
+  .other { color:var(--dim); border:1px solid var(--dim); }
+  .empty { padding:28px; color:var(--dim); text-align:center; }
+  .msg { margin-top:12px; color:var(--dim); font-size:12px; min-height:18px; }
+  .spot { color:var(--acc); font-size:11px; margin-left:6px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1><span class="dot">●</span> runo — environments</h1>
+  <p class="sub">one remote environment per branch · platform view</p>
+  <div class="bar">
+    <input id="token" type="password" placeholder="access token" />
+    <button id="refresh">refresh</button>
+  </div>
+  <div class="tablebox">
+    <table>
+      <thead><tr>
+        <th>env</th><th>owner</th><th>repo @ branch</th><th>instance</th>
+        <th>state</th><th>public IP</th><th>created</th><th></th>
+      </tr></thead>
+      <tbody id="rows"><tr><td colspan="8" class="empty">enter your token and refresh</td></tr></tbody>
+    </table>
+  </div>
+  <p class="msg" id="msg"></p>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+$("token").value = localStorage.getItem("runo-token") || "";
+
+async function api(path, opts = {}) {
+  const token = $("token").value.trim();
+  localStorage.setItem("runo-token", token);
+  const res = await fetch(path, {
+    ...opts,
+    headers: { authorization: "Bearer " + token, "content-type": "application/json", ...(opts.headers || {}) },
+  });
+  const data = await res.json();
+  if (!res.ok || data.error) throw new Error(data.error?.message || res.status);
+  return data.result;
+}
+
+function esc(s) { const d = document.createElement("span"); d.textContent = String(s ?? ""); return d.innerHTML; }
+
+async function load() {
+  $("msg").textContent = "loading…";
+  try {
+    const envs = await api("/v1/envs?live=1");
+    const rows = $("rows");
+    if (!envs.length) {
+      rows.innerHTML = '<tr><td colspan="8" class="empty">no environments — devs create them with <b>runo new &lt;name&gt;</b></td></tr>';
+    } else {
+      rows.innerHTML = envs.map((e) => {
+        const cls = e.state === "running" ? "running" : e.state === "stopped" ? "stopped" : "other";
+        return `<tr>
+          <td>${esc(e.envName)}</td>
+          <td>${esc(e.owner)}</td>
+          <td>${esc(e.repo)} @ ${esc(e.branch)}</td>
+          <td>${esc(e.instanceType)}${e.spot ? '<span class="spot">spot</span>' : ""}</td>
+          <td><span class="state ${cls}">${esc(e.state ?? "?")}</span></td>
+          <td>${esc(e.ip ?? "-")}</td>
+          <td>${esc((e.createdAt || "").slice(0, 16).replace("T", " "))}</td>
+          <td><button class="danger" onclick="destroyEnv('${esc(e.instanceId)}','${esc(e.envName)}')">destroy</button></td>
+        </tr>`;
+      }).join("");
+    }
+    $("msg").textContent = "updated " + new Date().toLocaleTimeString() + " · auto-refresh 15s";
+  } catch (err) {
+    $("msg").textContent = "error: " + err.message;
+  }
+}
+
+async function destroyEnv(instanceId, envName) {
+  if (!confirm(`Terminate ${envName} (${instanceId})? EBS data is destroyed.`)) return;
+  $("msg").textContent = "destroying " + envName + "…";
+  try {
+    await api("/v1/rpc", { method: "POST", body: JSON.stringify({ method: "destroy", args: [{ id: instanceId }] }) });
+    await load();
+  } catch (err) {
+    $("msg").textContent = "error: " + err.message;
+  }
+}
+
+$("refresh").onclick = load;
+setInterval(() => { if ($("token").value.trim()) load(); }, 15000);
+if ($("token").value.trim()) load();
+</script>
+</body>
+</html>

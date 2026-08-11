@@ -237,7 +237,10 @@ runo new my-task        # same CLI, same flow — AWS stays server-side
 
 - Every provider operation (create/suspend/exec/upload/…) goes through the
   server; long steps stream live output back to the terminal.
-- `GET /v1/envs` lists every env with its owner — the platform team's view.
+- **Web panel**: open `http://<server>:7777/` in a browser, paste your token —
+  live list of every env (owner, repo@branch, instance, state, public IP) with
+  auto-refresh and a destroy action. Same port, nothing else to deploy.
+- `GET /v1/envs` (`?live=1` for instance state) is the same data as JSON.
 - The recipe stays committed in each repo: platform team writes it once by PR,
   devs never touch infra config.
 - `runo agent` over the control plane uses an experimental WebSocket TTY
