@@ -70,6 +70,13 @@ export interface RuntimeProvider {
   exec(rt: Runtime, command: string, opts?: ExecOpts): Promise<ExecResult>;
   /** Inherited stdio (agent session, runo exec, logs -f). */
   execInteractive(rt: Runtime, command: string, opts?: { cwd?: string }): Promise<number>;
+  /** Chunked exec used by the control plane to forward live output. */
+  execStream?(
+    rt: Runtime,
+    command: string,
+    opts: ExecOpts,
+    sink: (chunk: { t: "out" | "err"; d: string }) => void,
+  ): Promise<number>;
 
   upload(rt: Runtime, localPath: string, remotePath: string): Promise<void>;
   /** Local→VM directory sync (runo push). */

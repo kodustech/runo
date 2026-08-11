@@ -207,6 +207,45 @@ compose overrides.
 | `runo suspend` (hibernating 4GB RAM) | ~1m30 |
 | `runo bake` (one-time) | ~11min |
 
+## Teams: control plane (v0) — no AWS credentials on laptops
+
+For solo use, the CLI talks to AWS directly with your local credentials. For
+teams, run **runo-server**: it holds the AWS credentials and the SSH keys;
+developers authenticate with a token and need **zero cloud credentials**.
+
+```
+dev laptop (CLI, no AWS creds)          runo-server (control plane)
+  RemoteProvider ─── HTTP/WS ───►       token auth → EC2 provider + SSH keys
+  RUNO_SERVER + RUNO_TOKEN              per-user env registry (platform view)
+```
+
+Operator (platform team), on a machine that has AWS credentials:
+
+```bash
+RUNO_HOME=~/.runo-server \
+RUNO_SERVER_TOKENS="alice:tok-a,bob:tok-b" \
+bun server/main.ts --port 7777
+```
+
+Developers:
+
+```bash
+export RUNO_SERVER=https://runo.internal.example.com
+export RUNO_TOKEN=tok-a
+runo new my-task        # same CLI, same flow — AWS stays server-side
+```
+
+- Every provider operation (create/suspend/exec/upload/…) goes through the
+  server; long steps stream live output back to the terminal.
+- `GET /v1/envs` lists every env with its owner — the platform team's view.
+- The recipe stays committed in each repo: platform team writes it once by PR,
+  devs never touch infra config.
+- `runo agent` over the control plane uses an experimental WebSocket TTY
+  tunnel; headless usage (`runo agent claude -- -p …`) works everywhere.
+- v0 is single-process with token auth and JSON state — put TLS/VPN
+  (ALB, Caddy, Tailscale) in front before exposing it beyond localhost.
+  Org-level quotas, SSO and a web panel are the next iterations.
+
 ## Security — accepted v1 limitations (documented on purpose)
 
 - **The public URL is IP:port, no TLS, no auth.** Anyone who finds the IP can

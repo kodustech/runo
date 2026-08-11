@@ -33,7 +33,7 @@ import { STSClient, GetCallerIdentityCommand } from "@aws-sdk/client-sts";
 import { AWS_REGION, HASH6, RUNO_HOME, MAX_INSTANCES, REMOTE_USER, SSH_DIR } from "../config";
 import { RunoError } from "../errors";
 import { log } from "../log";
-import { rsyncPull, rsyncPush, scpUpload, shq, sshExec, sshInteractive, type SshTarget } from "../ssh";
+import { rsyncPull, rsyncPush, scpUpload, shq, sshBaseArgs, sshExec, sshInteractive, type SshTarget } from "../ssh";
 import type { CreateSpec, ExecOpts, ExecResult, Runtime, RuntimeProvider, RuntimeState } from "./types";
 
 const AMI_SSM_PARAM =
@@ -583,6 +583,66 @@ export class Ec2Provider implements RuntimeProvider {
 
   async execInteractive(rt: Runtime, command: string, opts: { cwd?: string } = {}): Promise<number> {
     return await sshInteractive(this.target(rt), this.wrap(command, opts.cwd));
+  }
+
+  async execStream(
+    rt: Runtime,
+    command: string,
+    opts: ExecOpts,
+    sink: (chunk: { t: "out" | "err"; d: string }) => void,
+  ): Promise<number> {
+    const t = this.target(rt);
+    const proc = Bun.spawn(
+      ["ssh", ...sshBaseArgs(t), `${t.user}@${t.ip}`, this.wrap(command, opts.cwd)],
+      { stdin: "ignore", stdout: "pipe", stderr: "pipe" },
+    );
+    let timer: Timer | undefined;
+    if (opts.timeoutMs) timer = setTimeout(() => proc.kill(), opts.timeoutMs);
+    const pump = async (stream: ReadableStream, type: "out" | "err") => {
+      const reader = stream.getReader();
+      const dec = new TextDecoder();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        sink({ t: type, d: dec.decode(value) });
+      }
+    };
+    await Promise.all([
+      pump(proc.stdout as ReadableStream, "out"),
+      pump(proc.stderr as ReadableStream, "err"),
+    ]);
+    const code = await proc.exited;
+    if (timer) clearTimeout(timer);
+    return code;
+  }
+
+  /** Raw-byte streaming exec (control plane downloads: remote tar → HTTP body). */
+  async execStreamRaw(
+    rt: Runtime,
+    command: string,
+    sink: (chunk: Uint8Array) => void,
+  ): Promise<number> {
+    const t = this.target(rt);
+    const proc = Bun.spawn(
+      ["ssh", ...sshBaseArgs(t), `${t.user}@${t.ip}`, this.wrap(command)],
+      { stdin: "ignore", stdout: "pipe", stderr: "ignore" },
+    );
+    const reader = (proc.stdout as ReadableStream).getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      sink(value);
+    }
+    return await proc.exited;
+  }
+
+  /** Used by the control plane's interactive tunnel (ssh -tt with piped stdio). */
+  spawnTty(rt: Runtime, command: string): ReturnType<typeof Bun.spawn> {
+    const t = this.target(rt);
+    return Bun.spawn(
+      ["ssh", "-tt", ...sshBaseArgs(t), `${t.user}@${t.ip}`, command],
+      { stdin: "pipe", stdout: "pipe", stderr: "pipe" },
+    );
   }
 
   async upload(rt: Runtime, localPath: string, remotePath: string): Promise<void> {
