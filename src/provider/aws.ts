@@ -397,6 +397,8 @@ export class Ec2Provider implements RuntimeProvider {
   }
 
   private async describe(id: string): Promise<Runtime> {
+    // without an id, DescribeInstances would list the whole account
+    if (!id) return { id, ip: null, state: "unknown" };
     try {
       const res = await this.ec2.send(new DescribeInstancesCommand({ InstanceIds: [id] }));
       return this.mapInstance(res.Reservations?.[0]?.Instances?.[0], id);

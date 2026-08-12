@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { AGENT_ENV_PATH, RUNO_HOME, REMOTE_RUNO_DIR, TMP_DIR, remoteRepoDir } from "./config";
 import { requireAgentEnv } from "./agentAuth";
@@ -14,6 +14,7 @@ import {
   buildContextHere,
   contextFromEnv,
   currentBranch,
+  git,
   repoTop,
   resolveEnv,
   worktreePathFor,
@@ -38,6 +39,11 @@ Usage: runo <command> [args]
                               create nor ever remove it)
   agent <claude|codex> [...]  agent session ON the VM (auth injected, cwd in repo)
   validate [step]             runs validate: on the VM, downloads JSON+MD evidence
+  ship ["msg"] [--validate] [--destroy]
+                              finish flow in one command: pull → commit → push →
+                              open PR (gh). --validate only ships green and puts
+                              the evidence in the PR body; --destroy tears the
+                              env down after
   pull                        brings VM changes back to the local worktree (rsync)
   push [--restart]            pushes local worktree changes to the VM (rsync);
                               --restart restarts run: services (compose dev with
@@ -68,6 +74,8 @@ interface Flags {
   restart: boolean;
   rm: boolean;
   here: boolean;
+  validate: boolean;
+  destroyAfter: boolean;
   positional: string[];
   passthrough: string[]; // after --
 }
@@ -81,6 +89,8 @@ function parseFlags(args: string[]): Flags {
     restart: false,
     rm: false,
     here: false,
+    validate: false,
+    destroyAfter: false,
     positional: [],
     passthrough: [],
   };
@@ -97,6 +107,8 @@ function parseFlags(args: string[]): Flags {
     else if (a === "--restart") f.restart = true;
     else if (a === "--rm") f.rm = true;
     else if (a === "--here") f.here = true;
+    else if (a === "--validate") f.validate = true;
+    else if (a === "--destroy") f.destroyAfter = true;
     else if (a === "--all") f.all = true;
     else if (a === "--open") f.open = true;
     else if (a === "-f" || a === "--follow") f.follow = true;
@@ -232,6 +244,114 @@ async function cmdValidate(flags: Flags): Promise<void> {
     process.exit(1);
   }
   log.ok("validation passed");
+}
+
+async function cmdShip(flags: Flags): Promise<void> {
+  const env = resolveEnv({ branch: flags.branch });
+  const message = flags.positional[0];
+  const provider = getProvider(env.provider);
+
+  // 1. pull — tolerant: shipping must work even if the env already suspended
+  try {
+    const rt = await provider.status(env.runtime as unknown as Runtime);
+    if (rt.state === "running" && rt.ip) {
+      log.step(`pulling VM changes → ${env.worktree}`);
+      await provider.download(rt, `${remoteRepoDir(env.repo)}/`, `${env.worktree}/`, [
+        ".git",
+        "node_modules",
+        "dist",
+        ".kodus",
+      ]);
+    } else log.warn(`env is ${rt.state} — skipping pull, shipping the local state`);
+  } catch (e: any) {
+    log.warn(`could not pull from the VM (${e?.message ?? e}) — shipping the local state`);
+  }
+
+  // 2. only ship green (optional): validate on the VM, carry evidence into the PR
+  let evidenceMd: string | null = null;
+  if (flags.validate) {
+    const ctx = contextFromEnv(env);
+    const evidence = await validateEnv(ctx);
+    if (evidence.status !== "passed")
+      throw new RunoError(
+        "Validation FAILED — not shipping",
+        "Fix the failures (logs in .kodus/evidence/logs/) and run runo ship again",
+      );
+    try {
+      evidenceMd = readFileSync(
+        path.join(env.worktree, ".kodus", "evidence", `${evidence.sha}.md`),
+        "utf8",
+      );
+    } catch {}
+  }
+
+  // 3. commit — locally, with YOUR git identity (never from the cloud)
+  const dirty = git(env.worktree, "status", "--porcelain").stdout;
+  if (dirty) {
+    if (!message)
+      throw new RunoError(
+        "Working tree has changes — pass a commit message",
+        `runo ship "feat: what you did"`,
+      );
+    git(env.worktree, "add", "-A");
+    const c = git(env.worktree, "commit", "-m", message);
+    if (c.exitCode !== 0) throw new RunoError(`git commit failed: ${c.stderr}`);
+    log.ok(`committed: ${message}`);
+  } else log.info("working tree clean — nothing new to commit");
+
+  // 4. push
+  log.step(`pushing ${env.branch} → origin…`);
+  const p = git(env.worktree, "push", "-u", "origin", env.branch);
+  if (p.exitCode !== 0)
+    throw new RunoError(
+      `git push failed: ${p.stderr.trim().split("\n").pop()}`,
+      "Check the remote/credentials — ship runs locally, runo never pushes from the cloud",
+    );
+  log.ok("pushed");
+
+  // 5. PR via gh (graceful when unavailable)
+  const gh = (args: string[]) =>
+    Bun.spawnSync(["gh", ...args], { cwd: env.worktree, stdout: "pipe", stderr: "pipe" });
+  if (Bun.spawnSync(["gh", "--version"], { stdout: "pipe", stderr: "pipe" }).exitCode !== 0) {
+    log.warn("gh CLI not found — branch is pushed, open the PR manually");
+  } else {
+    const view = gh(["pr", "view", env.branch, "--json", "url", "-q", ".url"]);
+    if (view.exitCode === 0) {
+      log.ok(`PR already open: ${view.stdout.toString().trim()}`);
+    } else {
+      const urls = urlsFor(env, ((env.runtime as any).ip as string) ?? null);
+      const body = [
+        evidenceMd,
+        Object.entries(urls)
+          .map(([svc, u]) => `🔗 ${svc}: ${u}`)
+          .join("\n") || null,
+        "🤖 Shipped with [runo](https://github.com/kodustech/runo)",
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+      const create = gh([
+        "pr",
+        "create",
+        "--head",
+        env.branch,
+        "--title",
+        message ?? env.branch,
+        "--body",
+        body,
+      ]);
+      if (create.exitCode === 0) log.ok(`PR opened: ${create.stdout.toString().trim()}`);
+      else
+        log.warn(
+          `gh pr create failed: ${create.stderr.toString().trim().split("\n").pop()} — branch is pushed, open the PR manually`,
+        );
+    }
+  }
+
+  // 6. optional teardown
+  if (flags.destroyAfter) {
+    const fresh = registry.get(env.name);
+    if (fresh) await destroyOne(fresh);
+  }
 }
 
 async function cmdPull(flags: Flags): Promise<void> {
@@ -494,6 +614,7 @@ export async function main(argv: string[]): Promise<void> {
       case "agent": return await cmdAgent(flags);
       case "validate": return await cmdValidate(flags);
       case "pull": return await cmdPull(flags);
+      case "ship": return await cmdShip(flags);
       case "push": return await cmdPush(flags);
       case "url": return await cmdUrl(flags);
       case "tunnel": return await cmdTunnel(flags);

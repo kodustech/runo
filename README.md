@@ -55,6 +55,7 @@ Environment variables:
 | `runo agent <claude\|codex> [args…]` | agent session ON the VM in tmux (Ctrl+B D detaches without killing it; running again reattaches), cwd in the repo, auth injected |
 | `runo validate [step]` | runs `validate:` on the VM; downloads JSON+MD evidence; exit ≠ 0 on failure |
 | `runo pull` | rsync VM → local worktree (commit/push happen locally) |
+| `runo ship ["msg"] [--validate] [--destroy]` | the finish flow in one command: pull (tolerant of suspended envs) → commit → push → open the PR via `gh`. `--validate` only ships green and embeds the evidence in the PR body; `--destroy` tears the env down after |
 | `runo push [--restart]` | rsync local worktree → VM; `--restart` restarts `run:` services (compose dev with watch hot-reloads by itself) |
 | `runo url [--open]` | public URL of the `public` service (current IP + port) |
 | `runo logs [service] [-f]` | remote logs per service |
