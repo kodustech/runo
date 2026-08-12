@@ -130,6 +130,12 @@ async function finishUp(
   if (idle > 0)
     log.dim(`auto-suspend: the VM suspends itself after ${Math.round(idle / 60)}min of inactivity (limits.idle_suspend)`);
 
+  // control plane learns the env's services (per-env hostnames on the ingress)
+  await provider.registerServices?.(
+    rt,
+    plan.publicServices.map((s) => ({ name: s.name, port: s.port })),
+  );
+
   const updated = registry.upsert({
     ...env,
     runtime: rt as unknown as Record<string, unknown>,

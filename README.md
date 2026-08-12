@@ -252,6 +252,13 @@ runo new my-task        # same CLI, same flow — AWS stays server-side
 
 - Every provider operation (create/suspend/exec/upload/…) goes through the
   server; long steps stream live output back to the terminal.
+- **Ingress — one hostname per env** (`RUNO_INGRESS_DOMAIN=envs.example.com`
+  + wildcard DNS `*.envs.example.com` → the server): every env gets
+  `http://<slug>.envs.example.com`, extra services at
+  `http://<service>--<slug>.envs.example.com`. Solves parallel envs (no port
+  collisions), shareable links, and frontend API-base assumptions. Suspended
+  env → friendly 503 telling you to `runo resume`. v0 proxies HTTP only
+  (no WebSocket/HMR — use `runo tunnel` for that); terminate TLS in front.
 - **Web panel**: open `http://<server>:7777/` in a browser, paste your token —
   live list of every env (owner, repo@branch, instance, state, public IP) with
   auto-refresh and a destroy action. Same port, nothing else to deploy.

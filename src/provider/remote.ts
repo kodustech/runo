@@ -109,6 +109,13 @@ export class RemoteProvider implements RuntimeProvider {
   removeBootImage(): Promise<void> {
     return this.rpc("removeBootImage");
   }
+  async registerServices(rt: Runtime, services: { name: string; port: number }[]): Promise<void> {
+    const res = await this.post("/v1/register-services", { rt, services });
+    const data = (await res.json()) as any;
+    if (!res.ok || data.error)
+      throw new RunoError(data.error?.message ?? `register-services failed (${res.status})`);
+  }
+
   async cleanupShared(): Promise<void> {
     // shared resources (keypair/SG) belong to the server operator
     log.warn(

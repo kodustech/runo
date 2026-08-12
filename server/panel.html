@@ -90,7 +90,7 @@ async function load() {
           <td>${esc(e.repo)} @ ${esc(e.branch)}</td>
           <td>${esc(e.instanceType)}${e.spot ? '<span class="spot">spot</span>' : ""}</td>
           <td><span class="state ${cls}">${esc(e.state ?? "?")}</span></td>
-          <td>${esc(e.ip ?? "-")}</td>
+          <td>${e.url ? `<a href="${esc(e.url)}" target="_blank" style="color:var(--acc)">${esc(e.slug)}</a>` : esc(e.ip ?? "-")}</td>
           <td>${esc((e.createdAt || "").slice(0, 16).replace("T", " "))}</td>
           <td><button class="danger" onclick="destroyEnv('${esc(e.instanceId)}','${esc(e.envName)}')">destroy</button></td>
         </tr>`;

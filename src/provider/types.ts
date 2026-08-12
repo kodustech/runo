@@ -94,6 +94,9 @@ export interface RuntimeProvider {
    */
   tunnel?(rt: Runtime, ports: number[]): Promise<number>;
 
+  /** Tells the control plane which services/ports this env serves (ingress). */
+  registerServices?(rt: Runtime, services: { name: string; port: number }[]): Promise<void>;
+
   /**
    * Bakes a base boot image with provisioning done (runo bake) —
    * subsequent ups boot in ~1-2min instead of running full cloud-init.

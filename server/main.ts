@@ -48,6 +48,7 @@ function authUser(req: Request, url: URL): string | null {
 
 interface ServerEnv {
   envName: string;
+  slug: string;
   owner: string;
   repo: string;
   branch: string;
@@ -55,6 +56,8 @@ interface ServerEnv {
   instanceType: string;
   spot: boolean;
   createdAt: string;
+  /** filled by /v1/register-services once the env's pipeline finishes */
+  services?: { name: string; port: number }[];
 }
 
 const ENVS_PATH = path.join(RUNO_HOME, "server-envs.json");
@@ -134,6 +137,7 @@ async function handleRpc(user: string, body: any): Promise<Response> {
     const envs = loadEnvs();
     envs[spec.envName] = {
       envName: spec.envName,
+      slug: spec.slug,
       owner: user,
       repo: spec.repo,
       branch: spec.branch,
@@ -220,6 +224,73 @@ async function handleDownload(req: Request): Promise<Response> {
   return new Response(stream, { headers: { "content-type": "application/gzip" } });
 }
 
+// ---------- ingress: one hostname per env ----------
+//
+// RUNO_INGRESS_DOMAIN=envs.example.com + wildcard DNS (*.envs.example.com →
+// this server) gives every env a URL: http://<slug>.envs.example.com[:port].
+// Extra services: http://<service>--<slug>.envs.example.com (single label —
+// wildcard-cert friendly). v0 is HTTP proxying only (no WebSocket upgrade);
+// terminate TLS in front (Caddy/ALB/Cloudflare).
+
+const INGRESS_DOMAIN = (process.env.RUNO_INGRESS_DOMAIN ?? "").toLowerCase() || null;
+const ipCache = new Map<string, { ip: string | null; state: string; ts: number }>();
+
+async function envAddress(instanceId: string): Promise<{ ip: string | null; state: string }> {
+  const hit = ipCache.get(instanceId);
+  if (hit && Date.now() - hit.ts < 15_000) return hit;
+  const rt = await provider.status({ id: instanceId, ip: null, state: "unknown" });
+  const entry = { ip: rt.ip, state: rt.state, ts: Date.now() };
+  ipCache.set(instanceId, entry);
+  return entry;
+}
+
+function ingressUrlFor(e: ServerEnv): string | null {
+  if (!INGRESS_DOMAIN || !e.services?.length) return null;
+  return `http://${e.slug}.${INGRESS_DOMAIN}:${PORT}`;
+}
+
+async function handleIngress(req: Request, hostname: string): Promise<Response> {
+  const label = hostname.slice(0, hostname.length - (INGRESS_DOMAIN!.length + 1));
+  let svcName: string | undefined;
+  let slug = label;
+  const sep = label.indexOf("--");
+  if (sep > 0) {
+    svcName = label.slice(0, sep);
+    slug = label.slice(sep + 2);
+  }
+  const env = Object.values(loadEnvs()).find((e) => e.slug === slug);
+  if (!env) return new Response(`no environment for "${slug}"`, { status: 404 });
+  const services = env.services ?? [];
+  const svc = svcName ? services.find((s) => s.name === svcName) : services[0];
+  if (!svc)
+    return new Response(`environment "${slug}" has no ${svcName ? `service "${svcName}"` : "registered services"}`, {
+      status: 404,
+    });
+  const addr = await envAddress(env.instanceId);
+  if (addr.state !== "running" || !addr.ip)
+    return new Response(
+      `environment "${slug}" is ${addr.state} — resume it with: runo resume`,
+      { status: 503 },
+    );
+  const url = new URL(req.url);
+  const target = `http://${addr.ip}:${svc.port}${url.pathname}${url.search}`;
+  const headers = new Headers(req.headers);
+  headers.set("host", `${addr.ip}:${svc.port}`);
+  headers.set("x-forwarded-host", hostname);
+  headers.set("x-forwarded-proto", "http");
+  try {
+    const res = await fetch(target, {
+      method: req.method,
+      headers,
+      body: req.body,
+      redirect: "manual",
+    });
+    return new Response(res.body, { status: res.status, headers: res.headers });
+  } catch (e: any) {
+    return new Response(`upstream unreachable (${e?.message ?? e})`, { status: 502 });
+  }
+}
+
 // ---------- websocket tty (experimental) ----------
 
 interface TtyData {
@@ -231,6 +302,15 @@ const server = Bun.serve<TtyData, {}>({
   idleTimeout: 0,
   async fetch(req, srv) {
     const url = new URL(req.url);
+    // ingress: requests addressed to <slug>.<INGRESS_DOMAIN> are proxied to the env
+    const reqHostname = (req.headers.get("host") ?? "").split(":")[0].toLowerCase();
+    if (INGRESS_DOMAIN && reqHostname.endsWith("." + INGRESS_DOMAIN)) {
+      try {
+        return await handleIngress(req, reqHostname);
+      } catch (e) {
+        return errResponse(e);
+      }
+    }
     // web panel: static page, data itself still requires the token
     if ((url.pathname === "/" || url.pathname === "/index.html") && req.method === "GET") {
       const html = readFileSync(new URL("./panel.html", import.meta.url).pathname, "utf8");
@@ -253,6 +333,20 @@ const server = Bun.serve<TtyData, {}>({
       if (url.pathname === "/v1/download" && req.method === "POST") return await handleDownload(req);
       if (url.pathname === "/v1/policies" && req.method === "GET")
         return json({ result: loadPolicies() });
+      if (url.pathname === "/v1/register-services" && req.method === "POST") {
+        const { rt, services } = (await req.json()) as {
+          rt: Runtime;
+          services: { name: string; port: number }[];
+        };
+        const envs = loadEnvs();
+        for (const e of Object.values(envs))
+          if (e.instanceId === rt.id) {
+            e.services = services;
+            saveEnvs(envs);
+            return json({ result: null });
+          }
+        return json({ error: { message: `no registered env for instance ${rt.id}` } }, 404);
+      }
       if (url.pathname === "/v1/envs" && req.method === "GET") {
         const envs = Object.values(loadEnvs());
         if (url.searchParams.get("live") !== "1") return json({ result: envs });
@@ -261,9 +355,9 @@ const server = Bun.serve<TtyData, {}>({
           envs.map(async (e) => {
             try {
               const rt = await provider.status({ id: e.instanceId, ip: null, state: "unknown" });
-              return { ...e, state: rt.state, ip: rt.ip };
+              return { ...e, state: rt.state, ip: rt.ip, url: ingressUrlFor(e) };
             } catch {
-              return { ...e, state: "unknown", ip: null };
+              return { ...e, state: "unknown", ip: null, url: ingressUrlFor(e) };
             }
           }),
         );
