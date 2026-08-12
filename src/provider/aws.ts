@@ -33,7 +33,7 @@ import { STSClient, GetCallerIdentityCommand } from "@aws-sdk/client-sts";
 import { AWS_REGION, HASH6, RUNO_HOME, MAX_INSTANCES, REMOTE_USER, SSH_DIR } from "../config";
 import { RunoError } from "../errors";
 import { log } from "../log";
-import { rsyncPull, rsyncPush, scpUpload, shq, sshBaseArgs, sshExec, sshInteractive, type SshTarget } from "../ssh";
+import { rsyncPull, rsyncPush, scpUpload, shq, sshBaseArgs, sshCloseMaster, sshExec, sshInteractive, type SshTarget } from "../ssh";
 import type { CreateSpec, ExecOpts, ExecResult, Runtime, RuntimeProvider, RuntimeState } from "./types";
 
 const AMI_SSM_PARAM =
@@ -281,12 +281,21 @@ export class Ec2Provider implements RuntimeProvider {
           Ebs: {
             VolumeSize: opts.diskGb,
             VolumeType: "gp3" as const,
+            // above the free gp3 baseline (3000/125): docker builds/pulls are
+            // IO-bound and this costs ~US$0.01/h prorated
+            Iops: 4000,
+            Throughput: 300,
             DeleteOnTermination: true,
             // hibernation requires an encrypted root (default aws/ebs key)
             ...(mode === "hibernation" ? { Encrypted: true } : {}),
           },
         },
       ],
+      // burstable families: never throttle mid-build (surcharge only while
+      // bursting above baseline — cheaper than a wedged 30min build)
+      ...(opts.instanceType.startsWith("t")
+        ? { CreditSpecification: { CpuCredits: "unlimited" } }
+        : {}),
       ...(mode === "spot"
         ? {
             InstanceMarketOptions: {
@@ -717,6 +726,9 @@ export class Ec2Provider implements RuntimeProvider {
     }
     if (/status:\s*degraded/.test(out))
       log.warn("cloud-init finished 'degraded' — validating essential tooling anyway");
+    // drop the mux master opened during boot: group changes from provisioning
+    // (docker) only take effect on a fresh connection
+    await sshCloseMaster(this.target(rt));
   }
 
   // ---------- base image (runo bake) ----------
@@ -746,9 +758,13 @@ export class Ec2Provider implements RuntimeProvider {
         UserData: userData,
         NetworkInterfaces: [{ DeviceIndex: 0, AssociatePublicIpAddress: true, Groups: [sgId] }],
         BlockDeviceMappings: [
-          { DeviceName: rootDevice, Ebs: { VolumeSize: 30, VolumeType: "gp3", DeleteOnTermination: true } },
+          {
+            DeviceName: rootDevice,
+            Ebs: { VolumeSize: 30, VolumeType: "gp3", Iops: 4000, Throughput: 300, DeleteOnTermination: true },
+          },
         ],
         InstanceInitiatedShutdownBehavior: "stop",
+        CreditSpecification: { CpuCredits: "unlimited" },
         TagSpecifications: [
           { ResourceType: "instance", Tags: baseTags },
           { ResourceType: "volume", Tags: baseTags },

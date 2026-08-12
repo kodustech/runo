@@ -27,6 +27,11 @@ export function sshBaseArgs(t: SshTarget): string[] {
     "-o", "ServerAliveInterval=15",
     "-o", "ServerAliveCountMax=8",
     "-o", "LogLevel=ERROR",
+    // connection multiplexing: the first call opens a master, the rest reuse
+    // it — repeated exec/push drop from ~300-500ms of handshake to ~ms
+    "-o", "ControlMaster=auto",
+    "-o", `ControlPath=${path.join(SSH_DIR, "cm-%C")}`,
+    "-o", "ControlPersist=60s",
   ];
 }
 
@@ -56,6 +61,20 @@ export async function sshExec(
   ]);
   if (timer) clearTimeout(timer);
   return { exitCode: timedOut ? 124 : exitCode, stdout, stderr };
+}
+
+/**
+ * Drops the multiplexing master for this host. Needed after provisioning:
+ * sessions reuse the master's credentials from auth time, so group changes
+ * (usermod docker) only apply on a FRESH connection.
+ */
+export async function sshCloseMaster(t: SshTarget): Promise<void> {
+  const proc = Bun.spawn(["ssh", ...sshBaseArgs(t), "-O", "exit", `${t.user}@${t.ip}`], {
+    stdin: "ignore",
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  await proc.exited;
 }
 
 /** Session with inherited stdio (interactive agent, logs -f, exec). TTY when the local terminal is a TTY. */
