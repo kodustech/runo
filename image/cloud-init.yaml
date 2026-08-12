@@ -6,9 +6,10 @@ package_update: true
 write_files:
   # Idle auto-suspend: the VM shuts itself down (shutdown => EC2 "stopped",
   # which is runo suspend — EBS intact, runo resume brings it back).
-  # Activity = established SSH | load >= 0.20 | network traffic | agent CPU
-  # (claude/codex). Limit in seconds at /etc/runo/idle-limit (written by
-  # runo up from limits.idle_suspend; 0 = disabled).
+  # Activity = established SSH | EXTERNAL network traffic | agent CPU
+  # (claude/codex). Deliberately NOT load/internal traffic: dev stacks in
+  # watch mode keep both high forever with nobody using the env.
+  # Limit in seconds at /etc/runo/idle-limit (0 = disabled).
   - path: /usr/local/bin/runo-idle-check
     permissions: "0755"
     content: |
@@ -21,13 +22,15 @@ write_files:
       now=$(date +%s); active=""
       ss -Htn state established '( sport = :22 )' 2>/dev/null | grep -q . && active=ssh
       if [ -z "$active" ]; then
-        awk '{ exit ($1 >= 0.20) ? 0 : 1 }' /proc/loadavg && active=load
-      fi
-      if [ -z "$active" ]; then
-        bytes=$(awk -F'[: ]+' 'NR>2 && $2 != "lo" { rx+=$3; tx+=$11 } END { printf "%d", rx+tx }' /proc/net/dev)
-        prev=$(cat "$STATE/netbytes" 2>/dev/null || echo 0)
-        echo "$bytes" > "$STATE/netbytes"
-        [ $((bytes - prev)) -gt 102400 ] && active=net
+        # default-route interface only: container-to-container chatter and
+        # watch-mode rebuild loops must not count as user activity
+        IFACE=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
+        if [ -n "${IFACE:-}" ]; then
+          bytes=$(awk -F'[: ]+' -v ifc="$IFACE" 'NR>2 && $2 == ifc { print $3+$11; exit }' /proc/net/dev)
+          prev=$(cat "$STATE/netbytes" 2>/dev/null || echo 0)
+          echo "${bytes:-0}" > "$STATE/netbytes"
+          [ $(( ${bytes:-0} - prev )) -gt 102400 ] && active=net
+        fi
       fi
       if [ -z "$active" ]; then
         for pid in $(pgrep -x claude; pgrep -x codex); do
