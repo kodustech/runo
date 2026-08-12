@@ -43,6 +43,9 @@ Usage: runo <command> [args]
                               --restart restarts run: services (compose dev with
                               watch reloads by itself)
   url [--open]                prints/opens the public URL of the public service
+  tunnel [port...]            forwards localhost:<port> → VM:<port> (frontends
+                              work exactly like local dev; Ctrl+C stops).
+                              Defaults to the recipe's public ports
   logs [service] [-f]         remote logs per service
   exec -- <cmd...>            arbitrary command on the VM (cwd in repo)
   ls                          lists environments (state, URL, uptime, instance)
@@ -271,6 +274,30 @@ async function cmdPush(flags: Flags): Promise<void> {
   );
 }
 
+async function cmdTunnel(flags: Flags): Promise<void> {
+  const env = resolveEnv({ branch: flags.branch });
+  const rt = await runningRuntime(env);
+  const provider = getProvider(env.provider);
+  if (!provider.tunnel)
+    throw new RunoError(
+      "runo tunnel is not available via the control plane yet",
+      "Run it in direct mode (without RUNO_SERVER) — the tunnel needs the local SSH key",
+    );
+  const ports = flags.positional.length
+    ? flags.positional.map((p) => {
+        const n = Number(p);
+        if (!Number.isInteger(n) || n <= 0) throw new RunoError(`Invalid port: ${p}`);
+        return n;
+      })
+    : env.publicServices.map((s) => s.port);
+  if (ports.length === 0)
+    throw new RunoError("No ports to forward", "Pass them explicitly: runo tunnel 3000 3001");
+  log.ok(`tunnels active — Ctrl+C stops:`);
+  for (const p of ports) console.log(`  http://localhost:${p} → VM:${p}`);
+  const code = await provider.tunnel(rt, ports);
+  process.exit(code);
+}
+
 async function cmdUrl(flags: Flags): Promise<void> {
   const env = resolveEnv({ branch: flags.branch });
   const provider = getProvider(env.provider);
@@ -469,6 +496,7 @@ export async function main(argv: string[]): Promise<void> {
       case "pull": return await cmdPull(flags);
       case "push": return await cmdPush(flags);
       case "url": return await cmdUrl(flags);
+      case "tunnel": return await cmdTunnel(flags);
       case "logs": return await cmdLogs(flags);
       case "exec": return await cmdExec(flags);
       case "ls": return await cmdLs();

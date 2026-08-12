@@ -693,6 +693,16 @@ export class Ec2Provider implements RuntimeProvider {
     return await this.execInteractive(rt, command, opts);
   }
 
+  async tunnel(rt: Runtime, ports: number[]): Promise<number> {
+    const t = this.target(rt);
+    const forwards = ports.flatMap((p) => ["-L", `${p}:localhost:${p}`]);
+    const proc = Bun.spawn(
+      ["ssh", "-N", ...forwards, ...sshBaseArgs(t), `${t.user}@${t.ip}`],
+      { stdin: "inherit", stdout: "inherit", stderr: "inherit" },
+    );
+    return await proc.exited;
+  }
+
   // ---------- readiness ----------
 
   async waitReady(rt: Runtime, opts: { firstBoot?: boolean } = {}): Promise<void> {

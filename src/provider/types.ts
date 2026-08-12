@@ -89,6 +89,12 @@ export interface RuntimeProvider {
   logs(rt: Runtime, command: string, opts?: { cwd?: string }): Promise<number>;
 
   /**
+   * Foreground local→VM port forwarding (runo tunnel): localhost:<port> maps
+   * to the VM's <port> so browser/frontends behave exactly like local dev.
+   */
+  tunnel?(rt: Runtime, ports: number[]): Promise<number>;
+
+  /**
    * Bakes a base boot image with provisioning done (runo bake) —
    * subsequent ups boot in ~1-2min instead of running full cloud-init.
    */
