@@ -10,8 +10,7 @@ runo new checkout-fix        # branch task/checkout-fix + remote env (~1.5min wi
 runo agent claude            # Claude Code ON the VM — close the lid, it keeps working
 runo url --open              # see the app running on its public URL
 runo validate                # lint/tests on the VM + downloadable evidence
-runo pull                    # bring the diff back; commit & push from your laptop
-runo destroy                 # done
+runo ship "feat: ..." --validate --destroy   # pull → commit → push → PR with evidence, then teardown
 ```
 
 Provider v1 is **AWS EC2**, behind a `RuntimeProvider` interface — nothing
@@ -52,15 +51,17 @@ Environment variables:
 
 | Command | What it does |
 | --- | --- |
+| `runo setup` | guided doctor: checks tooling, AWS/control-plane access, agent credentials (validated against the API), recipe; fixes what it can |
 | `runo init [--force]` | inspects the repo and proposes `.kodus/workspace.yaml` |
 | `runo new <name>` | branch `task/<name>` + worktree + `runo up` |
-| `runo up [--branch B]` | materializes the remote env (idempotent: existing → resume/reconcile) |
+| `runo up [--branch B] [--here]` | materializes the remote env (idempotent: existing → resume/reconcile); `--here` uses the CURRENT working tree as sync anchor (Orca/worktree tools) |
 | `runo agent <claude\|codex> [args…]` | agent session ON the VM in tmux (Ctrl+B D detaches without killing it; running again reattaches), cwd in the repo, auth injected |
 | `runo validate [step]` | runs `validate:` on the VM; downloads JSON+MD evidence; exit ≠ 0 on failure |
 | `runo pull` | rsync VM → local worktree (commit/push happen locally) |
 | `runo ship ["msg"] [--validate] [--destroy]` | the finish flow in one command: pull (tolerant of suspended envs) → commit → push → open the PR via `gh`. `--validate` only ships green and embeds the evidence in the PR body; `--destroy` tears the env down after |
 | `runo push [--restart]` | rsync local worktree → VM; `--restart` restarts `run:` services (compose dev with watch hot-reloads by itself) |
 | `runo url [--open]` | public URL of the `public` service (current IP + port) |
+| `runo tunnel [port…]` | forwards `localhost:<port>` → VM (frontends behave exactly like local dev); defaults to the recipe's public ports |
 | `runo logs [service] [-f]` | remote logs per service |
 | `runo exec -- <cmd>` | arbitrary command on the VM, cwd in the repo |
 | `runo ls` | envs: branch, state, URL, uptime, instance |
@@ -126,7 +127,7 @@ validate:
   - name: lint
     run: pnpm run lint
 limits:
-  instance: t3.xlarge
+  instance: m7i-flex.xlarge  # non-burstable: heavy builds never throttle on CPU credits
   disk: 100gb
 ```
 
