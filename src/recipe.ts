@@ -14,9 +14,11 @@ export interface ServiceDef {
 }
 
 export interface ComposeDef {
-  file: string;
+  files: string[]; // yaml: file (string) or files (list) — overlay order preserved
   profiles: string[];
+  env?: Record<string, string>; // interpolation vars; ${RUNO_PUBLIC_IP} is substituted at up time
   public?: string; // service whose published port becomes the public URL
+  port?: number; // yaml: public_port — explicit public port when the service publishes many
   health?: string; // HTTP path on the public service
   healthTimeoutSec?: number; // yaml: health_timeout (default 120; heavy apps need more on first boot)
 }
@@ -99,8 +101,13 @@ export function parseRecipe(yamlText: string, source: string): NormalizedRecipe 
         `Invalid recipe (${source}): "services.compose" is mutually exclusive with other services (found: ${others.join(", ")})`,
       );
     const c = services.compose;
-    if (!c?.file)
-      throw new RunoError(`Invalid recipe (${source}): services.compose.file is required`);
+    const files: string[] = Array.isArray(c?.files)
+      ? c.files.map(String)
+      : c?.file
+        ? [String(c.file)]
+        : [];
+    if (files.length === 0)
+      throw new RunoError(`Invalid recipe (${source}): services.compose needs "file" or "files"`);
     return {
       version: 1,
       setup,
@@ -108,9 +115,13 @@ export function parseRecipe(yamlText: string, source: string): NormalizedRecipe 
       mode: "compose",
       services: {},
       compose: {
-        file: String(c.file),
+        files,
         profiles: Array.isArray(c.profiles) ? c.profiles.map(String) : [],
+        env: c.env
+          ? Object.fromEntries(Object.entries(c.env).map(([k, v]) => [k, String(v)]))
+          : undefined,
         public: c.public ? String(c.public) : undefined,
+        port: c.public_port !== undefined ? Number(c.public_port) : undefined,
         health: c.health ? String(c.health) : undefined,
         healthTimeoutSec: c.health_timeout !== undefined ? Number(c.health_timeout) : undefined,
       },

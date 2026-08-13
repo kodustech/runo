@@ -8,7 +8,7 @@ import type { Runtime, RuntimeProvider } from "../provider/types";
 import { registry, urlsFor, type EnvRecord } from "../registry";
 import { shq } from "../ssh";
 import { git, type EnvContext } from "./context";
-import { healthcheckPublic, probeServices, startServices, waitInternalPorts } from "./services";
+import { composePrefix, healthcheckPublic, probeServices, startServices, waitInternalPorts } from "./services";
 
 /** Tooling that cloud-init must have left ready on the VM. */
 const TOOLING_CHECK =
@@ -44,14 +44,69 @@ async function uploadCode(
   log.step("uploading code (git archive HEAD)…");
   mkdirSync(TMP_DIR, { recursive: true });
   const tarPath = path.join(TMP_DIR, `${ctx.envName}-code.tar`);
-  const archive = git(ctx.worktree, "archive", "--format=tar", "-o", tarPath, "HEAD");
-  if (archive.exitCode !== 0)
-    throw new RunoError(`git archive failed in worktree ${ctx.worktree}: ${archive.stderr}`);
+
+  // submodules: git archive exports them as EMPTY dirs — stage superproject +
+  // each submodule's HEAD into a temp tree and ship that. `submodule update
+  // --init` resolves objects from the shared .git/modules locally (no network
+  // for already-fetched commits; read-only in any case).
+  const hasSubmodules = existsSync(path.join(ctx.worktree, ".gitmodules"));
+  if (hasSubmodules) {
+    const stage = path.join(TMP_DIR, `${ctx.envName}-stage`);
+    rmSync(stage, { recursive: true, force: true });
+    mkdirSync(stage, { recursive: true });
+    const explode = (repoDir: string, ref: string, dest: string) => {
+      mkdirSync(dest, { recursive: true });
+      const r = Bun.spawnSync(["bash", "-c", `git -C ${JSON.stringify(repoDir)} archive --format=tar ${JSON.stringify(ref)} | tar -x -C ${JSON.stringify(dest)}`]);
+      if (r.exitCode !== 0)
+        throw new RunoError(`archive of ${repoDir}@${ref} failed: ${r.stderr.toString().trim()}`);
+    };
+    // Submodule content comes from ALREADY-populated checkouts at the exact
+    // commit each superproject records — `submodule update --init` silently
+    // no-ops in linked worktrees, and this path is guaranteed offline.
+    // Recursive: monorepos nest submodules (e.g. app → packages/commons).
+    const shipTree = (repoDir: string, ref: string, dest: string, origDir: string) => {
+      explode(repoDir, ref, dest);
+      const gm = path.join(dest, ".gitmodules");
+      if (!existsSync(gm)) return;
+      const modPaths = git(repoDir, "config", "--file", gm, "--get-regexp", "\\.path$")
+        .stdout.split("\n")
+        .map((l) => l.split(" ").slice(1).join(" ").trim())
+        .filter(Boolean);
+      for (const rel of modPaths) {
+        const sha = git(repoDir, "ls-tree", ref, rel).stdout.split(/\s+/)[2]; // "160000 commit <sha>\t<path>"
+        if (!sha) continue;
+        const candidates = [path.join(repoDir, rel), path.join(origDir, rel)];
+        const src = candidates.find((c) => existsSync(path.join(c, ".git")));
+        if (!src)
+          throw new RunoError(
+            `Submodule "${rel}" is not populated in ${repoDir} nor in ${origDir}`,
+            `Run: git -C ${origDir} submodule update --init --recursive`,
+          );
+        try {
+          shipTree(src, sha, path.join(dest, rel), path.join(origDir, rel));
+        } catch (e) {
+          if (e instanceof RunoError) throw e;
+          log.warn(`submodule ${rel}: recorded commit ${sha.slice(0, 7)} not found locally — shipping ${src}'s HEAD instead`);
+          shipTree(src, "HEAD", path.join(dest, rel), path.join(origDir, rel));
+        }
+      }
+    };
+    shipTree(ctx.worktree, "HEAD", stage, ctx.repoPath);
+    const pack = Bun.spawnSync(["tar", "-cf", tarPath, "-C", stage, "."]);
+    if (pack.exitCode !== 0) throw new RunoError(`packing staged tree failed: ${pack.stderr.toString().trim()}`);
+    rmSync(stage, { recursive: true, force: true });
+  } else {
+    const archive = git(ctx.worktree, "archive", "--format=tar", "-o", tarPath, "HEAD");
+    if (archive.exitCode !== 0)
+      throw new RunoError(`git archive failed in worktree ${ctx.worktree}: ${archive.stderr}`);
+  }
   await provider.upload(rt, tarPath, "/tmp/runo-code.tar");
   rmSync(tarPath, { force: true });
+  // sudo: containers may have written root-owned files (node_modules) into
+  // the bind-mounted tree — a plain rm as the ssh user cannot remove them
   const extract = await provider.exec(
     rt,
-    `rm -rf ${shq(remoteDir)} && mkdir -p ${shq(remoteDir)} && tar -xf /tmp/runo-code.tar -C ${shq(remoteDir)} && rm -f /tmp/runo-code.tar`,
+    `sudo rm -rf ${shq(remoteDir)} && mkdir -p ${shq(remoteDir)} && tar -xf /tmp/runo-code.tar -C ${shq(remoteDir)} && rm -f /tmp/runo-code.tar`,
   );
   if (extract.exitCode !== 0)
     throw new RunoError(`Code extraction on the VM failed: ${extract.stderr.trim()}`);
@@ -223,6 +278,16 @@ export async function upEnv(ctx: EnvContext): Promise<EnvRecord> {
   if (!repoExists) {
     log.warn("previous materialization incomplete — redoing upload/setup/services");
     await provider.waitReady(rt);
+    // a previous round may have left the stack running on top of the tree we
+    // are about to wipe — bring it down first (named volumes survive, so
+    // dependency installs stay cached)
+    if (ctx.recipe.mode === "compose") {
+      log.step("stopping the previous stack before re-upload…");
+      await provider.exec(rt, `${composePrefix(ctx.recipe, rt.ip)} down --remove-orphans || true`, {
+        cwd: remoteDir,
+        timeoutMs: 10 * 60_000,
+      });
+    }
     await uploadCode(provider, rt, ctx, remoteDir);
     await runSteps(provider, rt, remoteDir, "setup", ctx.recipe.setup);
     return await finishUp(provider, rt, ctx, env, { runData: true });

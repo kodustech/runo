@@ -553,7 +553,7 @@ async function cmdLogs(flags: Flags): Promise<void> {
 
   let cmd: string;
   if (ctx.recipe.mode === "compose") {
-    cmd = `${composePrefix(ctx.recipe)} logs --tail=200 ${follow ? "-f " : ""}${svc ? shq(svc) : ""}`;
+    cmd = `${composePrefix(ctx.recipe, rt.ip)} logs --tail=200 ${follow ? "-f " : ""}${svc ? shq(svc) : ""}`;
   } else if (svc) {
     const def = ctx.recipe.services[svc];
     if (!def)

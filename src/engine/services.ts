@@ -21,11 +21,25 @@ export function tmuxSession(svc: string): string {
   return `runo-${svc}`;
 }
 
-/** docker compose prefix for passthrough mode (repo's file + profiles). */
-export function composePrefix(recipe: NormalizedRecipe): string {
+/**
+ * docker compose prefix for passthrough mode: env vars for interpolation
+ * (with ${RUNO_PUBLIC_IP} substituted), -f overlays in order, profiles.
+ */
+export function composePrefix(recipe: NormalizedRecipe, publicIp?: string | null): string {
   const c = recipe.compose!;
+  const env = Object.entries(c.env ?? {})
+    .map(([k, v]) => {
+      const val = v
+        .replaceAll("${RUNO_PUBLIC_IP}", publicIp ?? "")
+        // dashed form for wildcard-DNS services (nip.io/sslip.io) where dotted
+        // IPs are ambiguous next to other numeric labels
+        .replaceAll("${RUNO_PUBLIC_IP_DASHED}", (publicIp ?? "").replaceAll(".", "-"));
+      return `${k}=${shq(val)} `;
+    })
+    .join("");
+  const files = c.files.map((f) => ` -f ${shq(f)}`).join("");
   const profiles = c.profiles.map((p) => ` --profile ${shq(p)}`).join("");
-  return `docker compose -f ${shq(c.file)}${profiles}`;
+  return `${env}docker compose${files}${profiles}`;
 }
 
 function generatedComposeYaml(recipe: NormalizedRecipe): string {
@@ -116,7 +130,8 @@ async function startComposePassthrough(
   remoteDir: string,
 ): Promise<ServicePlan> {
   const c = recipe.compose!;
-  const prefix = composePrefix(recipe);
+  const filesLabel = c.files.join(" + ");
+  const prefix = composePrefix(recipe, rt.ip);
 
   // Resolve the effective compose ON the VM (interpolation uses the uploaded .env)
   const cfg = await provider.exec(rt, `${prefix} config --format json`, {
@@ -125,14 +140,14 @@ async function startComposePassthrough(
   });
   if (cfg.exitCode !== 0)
     throw new RunoError(
-      `docker compose config failed for ${c.file}`,
+      `docker compose config failed for ${filesLabel}`,
       cfg.stderr.trim().split("\n").slice(-5).join("\n"),
     );
   let parsed: any;
   try {
     parsed = JSON.parse(cfg.stdout);
   } catch {
-    throw new RunoError(`docker compose config output is not valid JSON (${c.file})`);
+    throw new RunoError(`docker compose config output is not valid JSON (${filesLabel})`);
   }
 
   const services: Record<string, any> = parsed.services ?? {};
@@ -148,15 +163,17 @@ async function startComposePassthrough(
   }
   if (!publicName || !services[publicName])
     throw new RunoError(
-      `Public service "${c.public ?? "?"}" does not exist in the effective compose (${c.file})`,
+      `Public service "${c.public ?? "?"}" does not exist in the effective compose (${filesLabel})`,
       `Available services: ${Object.keys(services).join(", ")}`,
     );
   const publicPorts = publishedOf(services[publicName]);
   if (publicPorts.length === 0)
-    throw new RunoError(`Public service "${publicName}" publishes no ports in ${c.file}`);
-  const publicPort = publicPorts[0]!;
+    throw new RunoError(`Public service "${publicName}" publishes no ports in ${filesLabel}`);
+  const publicPort = c.port ?? publicPorts[0]!;
+  if (c.port && !publicPorts.includes(c.port))
+    log.warn(`public_port ${c.port} is not among ${publicName}'s published ports — proceeding anyway`);
 
-  log.step(`starting the repo's compose (${c.file}${c.profiles.length ? `, profiles: ${c.profiles.join(",")}` : ""}) — the first up builds images and can take a while…`);
+  log.step(`starting the repo's compose (${filesLabel}${c.profiles.length ? `, profiles: ${c.profiles.join(",")}` : ""}) — the first up builds images and can take a while…`);
   const up = await provider.exec(rt, `${prefix} up -d`, {
     cwd: remoteDir,
     stream: true,
@@ -164,11 +181,13 @@ async function startComposePassthrough(
   });
   if (up.exitCode !== 0)
     throw new RunoError(
-      `docker compose up failed (${c.file})`,
-      `Check the logs: runo logs — or on the VM: ${c.file}`,
+      `docker compose up failed (${filesLabel})`,
+      `Check the logs: runo logs — or on the VM: ${filesLabel}`,
     );
 
-  const internalPorts = Object.values(services).flatMap((s) => publishedOf(s));
+  // with an explicit public_port, skip sweeping every published port (a
+  // shared-netns service can publish dozens; docker-proxy binds them instantly)
+  const internalPorts = c.port ? [c.port] : Object.values(services).flatMap((s) => publishedOf(s));
   return {
     publicServices: [
       { name: publicName, port: publicPort, health: c.health, healthTimeoutSec: c.healthTimeoutSec },
@@ -313,7 +332,7 @@ async function serviceLogTail(
 ): Promise<string> {
   try {
     if (recipe.mode === "compose") {
-      const r = await provider.exec(rt, `${composePrefix(recipe)} logs --tail 30 ${shq(svcName)}`, {
+      const r = await provider.exec(rt, `${composePrefix(recipe, rt.ip)} logs --tail 30 ${shq(svcName)}`, {
         cwd: remoteDir,
         timeoutMs: 30_000,
       });

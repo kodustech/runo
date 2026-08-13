@@ -105,7 +105,26 @@ limits:
                             # Spot skips the warm pool and hibernation.
 ```
 
-**Passthrough mode** (repos with their own compose):
+**Passthrough mode** (repos with their own compose). Multi-file overlays,
+interpolation env (with `${RUNO_PUBLIC_IP}` / `${RUNO_PUBLIC_IP_DASHED}`
+substituted at up time — dashed form for nip.io-style wildcard DNS) and an
+explicit `public_port` are supported:
+
+```yaml
+services:
+  compose:
+    files: [docker/compose.yml, docker/compose.preview.yml]
+    profiles: [back, front]
+    env: { PREVIEW_DOMAIN: "${RUNO_PUBLIC_IP_DASHED}.nip.io" }
+    public: gateway
+    public_port: 80
+```
+
+Git submodules are shipped automatically (recursively): each submodule's
+content is archived from an already-populated checkout at the exact commit the
+superproject records — fully offline, still tracked-files-only.
+
+**Simple passthrough** (single compose file):
 
 ```yaml
 version: 1
