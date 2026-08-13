@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { AGENT_ENV_PATH, RUNO_HOME, REMOTE_RUNO_DIR, TMP_DIR, remoteRepoDir } from "./config";
-import { requireAgentEnv } from "./agentAuth";
+import { requireAgentEnv, resolveAgentEnv } from "./agentAuth";
 import { RunoError } from "./errors";
 import { fmtDuration, log } from "./log";
 import { getProvider } from "./provider";
@@ -31,6 +31,8 @@ const USAGE = `runo — one remote environment per branch (AWS EC2)
 
 Usage: runo <command> [args]
 
+  setup                       guided setup: checks every prerequisite, tells you
+                              exactly what's missing and fixes what it can
   init [--force]              inspects the repo and proposes .kodus/workspace.yaml
   new <name>                  creates branch task/<name> + remote env (runo up)
   up [--branch B] [--here]    materializes/resumes the branch's env (idempotent);
@@ -138,6 +140,114 @@ async function runningRuntime(env: EnvRecord): Promise<Runtime> {
 }
 
 // ---------------- commands ----------------
+
+async function cmdSetup(): Promise<void> {
+  const interactive = process.stdin.isTTY === true;
+  let problems = 0;
+
+  // 1. local tooling
+  for (const bin of ["git", "ssh", "rsync"]) {
+    if (Bun.which(bin)) log.ok(`${bin} found`);
+    else {
+      log.error(`${bin} not found — install it and run runo setup again`);
+      problems++;
+    }
+  }
+  if (Bun.which("gh")) log.ok("gh found (runo ship can open PRs)");
+  else log.warn("gh not found — runo ship will push but skip PR creation (brew install gh)");
+
+  // 2. cloud access (control plane or direct AWS)
+  if (process.env.RUNO_SERVER) {
+    try {
+      await getProvider("aws").preflight();
+      log.ok(`control plane reachable (${process.env.RUNO_SERVER})`);
+    } catch (e: any) {
+      log.error(e.message);
+      if (e.hint) log.info(`→ ${e.hint}`);
+      problems++;
+    }
+  } else {
+    try {
+      await getProvider("aws").preflight();
+      log.ok("AWS credentials valid (direct mode)");
+    } catch (e: any) {
+      log.error(e.message);
+      if (e.hint) log.info(`→ ${e.hint}`);
+      log.info("→ team setup without AWS credentials: export RUNO_SERVER + RUNO_TOKEN (ask your platform operator)");
+      problems++;
+    }
+  }
+
+  // 3. agent credentials
+  const agentEnv = resolveAgentEnv();
+  let claudeOk = false;
+  if (agentEnv.CLAUDE_CODE_OAUTH_TOKEN) {
+    log.ok("claude subscription token found (CLAUDE_CODE_OAUTH_TOKEN)");
+    claudeOk = true;
+  } else if (agentEnv.ANTHROPIC_API_KEY) {
+    // presence is not enough — validate against the API (dead keys are the #1 trap)
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/models", {
+        headers: { "x-api-key": agentEnv.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (res.ok) {
+        log.ok("ANTHROPIC_API_KEY is valid (claude will use the API key)");
+        claudeOk = true;
+      } else {
+        log.error(`ANTHROPIC_API_KEY is INVALID (API returned ${res.status}) — remove it from ${AGENT_ENV_PATH}`);
+        log.info("→ prefer your subscription: run `claude setup-token` and save CLAUDE_CODE_OAUTH_TOKEN instead");
+        problems++;
+      }
+    } catch {
+      log.warn("could not reach api.anthropic.com to validate the key — check your network");
+    }
+  }
+  if (!claudeOk && !agentEnv.ANTHROPIC_API_KEY) {
+    log.warn("no claude credentials found — `runo agent claude` will not authenticate");
+    log.info("→ run `claude setup-token` (uses your subscription), then paste the token below");
+    if (interactive) {
+      const token = prompt("  CLAUDE_CODE_OAUTH_TOKEN (Enter to skip):")?.trim();
+      if (token) {
+        mkdirSync(path.dirname(AGENT_ENV_PATH), { recursive: true });
+        const line = `CLAUDE_CODE_OAUTH_TOKEN=${token}\n`;
+        writeFileSync(AGENT_ENV_PATH, (existsSync(AGENT_ENV_PATH) ? readFileSync(AGENT_ENV_PATH, "utf8") : "") + line, { mode: 0o600 });
+        log.ok(`saved to ${AGENT_ENV_PATH}`);
+      } else problems++;
+    } else problems++;
+  }
+  if (agentEnv.OPENAI_API_KEY) log.ok("OPENAI_API_KEY found (codex available)");
+
+  // 4. recipe in the current repo (informative)
+  const top = repoTop(process.cwd());
+  if (top) {
+    if (existsSync(path.join(top, ".kodus", "workspace.yaml"))) log.ok(`recipe found in ${path.basename(top)}`);
+    else log.warn(`no recipe in ${path.basename(top)} — run \`runo init\` at the repo root when ready`);
+  }
+
+  // 5. speed-ups (direct mode)
+  if (!process.env.RUNO_SERVER && problems === 0) {
+    const provider = getProvider("aws");
+    const pool = await provider.poolStatus().catch(() => []);
+    if (pool.length > 0) log.ok(`warm pool: ${pool.length} instance(s) ready`);
+    else if (
+      interactive &&
+      confirm("Bake a base image + warm pool now? (~15min once; envs then create in ~1.5min)")
+    ) {
+      await provider.prepareBootImage();
+      await provider.poolScale(1);
+      log.ok("bake + pool ready");
+    } else log.info("optional: `runo bake && runo pool 1` makes env creation ~1.5min instead of ~7");
+  }
+
+  if (problems === 0) {
+    log.ok("all set — create your first environment:");
+    console.log("  cd <your repo> && runo new my-task     (or `runo up --here` inside a worktree)");
+  } else {
+    log.warn(`${problems} item(s) need attention above — fix them and run runo setup again`);
+    process.exit(1);
+  }
+}
 
 async function cmdInit(flags: Flags): Promise<void> {
   const repo = requireRepo();
@@ -608,6 +718,7 @@ export async function main(argv: string[]): Promise<void> {
   try {
     const flags = parseFlags(rest);
     switch (cmd) {
+      case "setup": return await cmdSetup();
       case "init": return await cmdInit(flags);
       case "new": return await cmdNew(flags);
       case "up": return await cmdUp(flags);

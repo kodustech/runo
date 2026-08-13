@@ -21,11 +21,14 @@ outside `src/provider/aws.ts` knows about AWS, by design.
 
 ```bash
 git clone https://github.com/kodustech/runo.git
-cd runo
-bun install
-bun link          # makes `runo` available globally (~/.bun/bin/runo)
-runo help
+cd runo && ./install.sh
 ```
+
+`install.sh` installs bun if missing, links the `runo` binary and runs
+**`runo setup`** — a guided check of every prerequisite (tooling, AWS or
+control-plane access, agent credentials **validated against the API**, recipe,
+speed-ups), telling you exactly what to fix and fixing what it can. Run
+`runo setup` again anytime; it exits non-zero while something is missing.
 
 Local prerequisites:
 
