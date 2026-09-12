@@ -1,5 +1,7 @@
 import path from "node:path";
-import { SSH_DIR } from "./config";
+import { mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { HASH6, SSH_DIR } from "./config";
 
 export interface SshTarget {
   ip: string;
@@ -18,6 +20,21 @@ export function shq(s: string): string {
   return `'${s.replaceAll("'", `'\\''`)}'`;
 }
 
+/**
+ * Multiplexing socket path. Unix sockets cap at ~104 bytes, and %C expands to
+ * 40 more: a deep RUNO_HOME turns EVERY ssh call into "ControlPath too long",
+ * which surfaces as "SSH did not respond" and sends you looking at security
+ * groups. Fall back to a short path under the system temp dir, still scoped by
+ * the install hash.
+ */
+function controlPath(): string {
+  const natural = path.join(SSH_DIR, "cm-%C");
+  if (natural.length + 40 - 2 <= 100) return natural;
+  const dir = path.join(tmpdir(), `runo-${HASH6}`);
+  mkdirSync(dir, { recursive: true });
+  return path.join(dir, "cm-%C");
+}
+
 export function sshBaseArgs(t: SshTarget): string[] {
   return [
     "-i", t.keyPath,
@@ -30,7 +47,7 @@ export function sshBaseArgs(t: SshTarget): string[] {
     // connection multiplexing: the first call opens a master, the rest reuse
     // it — repeated exec/push drop from ~300-500ms of handshake to ~ms
     "-o", "ControlMaster=auto",
-    "-o", `ControlPath=${path.join(SSH_DIR, "cm-%C")}`,
+    "-o", `ControlPath=${controlPath()}`,
     "-o", "ControlPersist=60s",
   ];
 }

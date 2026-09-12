@@ -78,6 +78,15 @@ runcmd:
   # bun for the ubuntu user
   - su - ubuntu -c 'curl -fsSL https://bun.sh/install | bash'
   - echo 'export PATH=/home/ubuntu/.bun/bin:$PATH' > /etc/profile.d/runo-path.sh
+  # caddy: expose.mode "https" (the default for new recipes) terminates TLS
+  # here, with a Let's Encrypt certificate for the VM's sslip.io name
+  - apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https
+  - curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --batch --yes --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  - curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' > /etc/apt/sources.list.d/caddy-stable.list
+  - apt-get update -qq && apt-get install -y -qq caddy
+  # cloudflared: recipes with expose.mode "tunnel" get an HTTPS URL per service
+  # without a single inbound port open (the VM dials out to Cloudflare)
+  - ARCH=$(dpkg --print-architecture); curl -fsSL -o /tmp/cloudflared.deb "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}.deb" && dpkg -i /tmp/cloudflared.deb; rm -f /tmp/cloudflared.deb
   # git usable by the agent on the VM
   - git config --system user.name runo
   - git config --system user.email runo@kodus.local

@@ -26,6 +26,10 @@ export interface EnvRecord {
    * destroy must NOT remove it. */
   externalWorktree?: boolean;
   publicServices: PublicService[];
+  /** How this env is published (recipe expose.mode) — "ip" for older records. */
+  exposeMode?: string;
+  /** service name → public URL, as handed out by the expose layer. */
+  urls?: Record<string, string>;
   createdAt: string;
   updatedAt: string;
   lastUpAt?: string;
@@ -104,9 +108,18 @@ export const registry = {
   },
 };
 
+/**
+ * Public URLs of the env. Whatever the expose layer handed out wins; the
+ * IP:port form is the fallback for records written before expose existed.
+ */
 export function urlsFor(env: EnvRecord, ip: string | null): Record<string, string> {
   const out: Record<string, string> = {};
-  if (!ip) return out;
-  for (const svc of env.publicServices) out[svc.name] = `http://${ip}:${svc.port}`;
+  // keep the recipe's service order (publicServices[0] is the primary)
+  for (const svc of env.publicServices) {
+    const fromExpose = env.urls?.[svc.name];
+    if (fromExpose) out[svc.name] = fromExpose;
+    else if (ip) out[svc.name] = `http://${ip}:${svc.port}`;
+  }
+  for (const [name, url] of Object.entries(env.urls ?? {})) if (!out[name]) out[name] = url;
   return out;
 }

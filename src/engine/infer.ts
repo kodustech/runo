@@ -134,6 +134,11 @@ export function inferRecipe(repoPath: string): { yaml: string; notes: string[] }
   if (test) validate.push({ name: test.replace(/:/g, "-"), run: runScript(test) });
   if (validate.length > 0) doc.validate = validate;
 
+  // A real certificate on the first up, with no account anywhere: Caddy issues
+  // it for the VM's sslip.io name. `tunnel` (+ domain) is the upgrade for a
+  // hostname that has to survive suspend/resume.
+  doc.expose = { mode: "https" };
+
   doc.limits = heavy
     ? { instance: "t3.xlarge", disk: "100gb" }
     : { instance: "t3.medium", disk: "30gb" };

@@ -20,8 +20,19 @@ export const REGISTRY_PATH = path.join(RUNO_HOME, "envs.json");
 /** Global agent credentials file — independent of RUNO_HOME. */
 export const AGENT_ENV_PATH = path.join(homedir(), ".kodus", "agent.env");
 
-/** Cost guardrail: maximum simultaneous RUNNING instances. */
-export const MAX_INSTANCES = 3;
+/**
+ * Cost guardrail: maximum simultaneous RUNNING instances.
+ * A laptop wants a low ceiling; CI running one preview per open pull request
+ * needs a different one — RUNO_MAX_INSTANCES moves it deliberately.
+ */
+export const MAX_INSTANCES = (() => {
+  const raw = process.env.RUNO_MAX_INSTANCES?.trim();
+  if (!raw) return 3;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1)
+    throw new Error(`RUNO_MAX_INSTANCES must be a positive integer (got "${raw}")`);
+  return n;
+})();
 
 /** runo's remote state directory on the VM. */
 export const REMOTE_RUNO_DIR = "/home/ubuntu/.runo";

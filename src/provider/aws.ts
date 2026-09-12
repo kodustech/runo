@@ -88,6 +88,26 @@ export class Ec2Provider implements RuntimeProvider {
   private async ensureKeyPair(): Promise<void> {
     mkdirSync(SSH_DIR, { recursive: true });
     const pubPath = `${this.keyPath}.pub`;
+    // RUNO_SSH_KEY: the private key as a value instead of a file. An ephemeral
+    // CI runner has no ~/.runo, so without this every job would generate a new
+    // key, re-import the AWS keypair, and lock itself out of the environment
+    // the previous job created for the same branch.
+    const injected = process.env.RUNO_SSH_KEY;
+    if (injected && !existsSync(this.keyPath)) {
+      writeFileSync(this.keyPath, injected.endsWith("\n") ? injected : `${injected}\n`, {
+        mode: 0o600,
+      });
+      const pub = Bun.spawnSync(["ssh-keygen", "-y", "-f", this.keyPath], {
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      if (pub.exitCode !== 0)
+        throw new RunoError(
+          `RUNO_SSH_KEY is not a usable private key: ${pub.stderr.toString().trim()}`,
+          "Pass the full private key, newlines included",
+        );
+      writeFileSync(pubPath, pub.stdout.toString());
+    }
     if (!existsSync(this.keyPath)) {
       const gen = Bun.spawnSync(
         ["ssh-keygen", "-t", "ed25519", "-N", "", "-C", this.keyName, "-f", this.keyPath],
@@ -868,6 +888,29 @@ export class Ec2Provider implements RuntimeProvider {
   }
 
   // ---------- inventory / cleanup ----------
+
+  /**
+   * The env's instance found by its tags, for a caller that has no registry —
+   * a CI runner is a fresh machine on every job, and creating a second VM for
+   * a branch that already has one is both wrong and expensive.
+   */
+  async findByTags(repo: string, branch: string): Promise<Runtime | null> {
+    const res = await this.ec2.send(
+      new DescribeInstancesCommand({
+        Filters: [
+          { Name: "tag:runo:managed", Values: ["true"] },
+          { Name: "tag:runo:home-hash", Values: [HASH6] },
+          { Name: "tag:runo:repo", Values: [repo] },
+          { Name: "tag:runo:branch", Values: [branch] },
+          { Name: "instance-state-name", Values: ["pending", "running", "stopping", "stopped"] },
+        ],
+      }),
+    );
+    const found = (res.Reservations ?? [])
+      .flatMap((r) => r.Instances ?? [])
+      .sort((a, b) => (b.LaunchTime?.getTime() ?? 0) - (a.LaunchTime?.getTime() ?? 0))[0];
+    return found ? this.mapInstance(found, found.InstanceId!) : null;
+  }
 
   async listManaged(): Promise<Runtime[]> {
     // Scoped by runo:home-hash: parallel runo installs in the same account
