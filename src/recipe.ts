@@ -234,7 +234,20 @@ function recipeRelPath(): string {
 
 /** Loads the recipe from the first directory that has it. */
 export function loadRecipe(...dirs: string[]): { recipe: NormalizedRecipe; path: string } {
-  const rel = recipeRelPath();
+  return loadRecipeFrom(undefined, dirs);
+}
+
+/**
+ * Same, for a caller that knows which recipe this env was built from (the
+ * registry records it): a later `push`/`url` must not silently fall back to
+ * the default recipe and reconcile the env with a different shape.
+ * An explicit --recipe still wins.
+ */
+export function loadRecipeFrom(
+  remembered: string | undefined,
+  dirs: string[],
+): { recipe: NormalizedRecipe; path: string } {
+  const rel = process.env.RUNO_RECIPE?.trim() || remembered || RECIPE_REL_PATH;
   if (path.isAbsolute(rel)) {
     if (!existsSync(rel)) throw new RunoError(`Recipe not found: ${rel}`);
     return { recipe: parseRecipe(readFileSync(rel, "utf8"), rel), path: rel };

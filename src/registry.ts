@@ -26,6 +26,8 @@ export interface EnvRecord {
    * destroy must NOT remove it. */
   externalWorktree?: boolean;
   publicServices: PublicService[];
+  /** Recipe this env was materialized from, relative to the repo (--recipe). */
+  recipe?: string;
   /** How this env is published (recipe expose.mode) — "ip" for older records. */
   exposeMode?: string;
   /** service name → public URL, as handed out by the expose layer. */

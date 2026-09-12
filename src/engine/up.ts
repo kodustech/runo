@@ -15,6 +15,12 @@ import { composePrefix, healthcheckPublic, planServices, probeServices, startSer
 const TOOLING_CHECK =
   "docker --version && docker compose version && git --version && tmux -V && rsync --version | head -1 && node --version && bun --version && pnpm --version && claude --version && codex --version";
 
+/** The recipe path as the repo sees it, so another machine can load the same one. */
+function recipeRelative(ctx: EnvContext): string {
+  const rel = path.relative(ctx.worktree, ctx.recipePath);
+  return rel.startsWith("..") ? ctx.recipePath : rel;
+}
+
 function baseRecord(ctx: EnvContext): EnvRecord {
   return (
     registry.get(ctx.envName) ?? {
@@ -211,6 +217,7 @@ async function finishUp(
     state: "running",
     materialized: true,
     publicServices: plan.publicServices,
+    recipe: recipeRelative(ctx),
     exposeMode: ctx.recipe.expose.mode,
     urls,
     lastUpAt: new Date().toISOString(),

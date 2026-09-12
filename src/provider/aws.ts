@@ -62,7 +62,33 @@ export class Ec2Provider implements RuntimeProvider {
     return path.join(SSH_DIR, this.keyName);
   }
 
+  /**
+   * Writes RUNO_SSH_KEY to disk if it is not there yet. Every ssh operation
+   * goes through target(), including the ones that create nothing — adopting
+   * an existing env skips ensureKeyPair entirely, and without the key on disk
+   * that env looks unreachable and gets rebuilt from scratch.
+   */
+  private materializeInjectedKey(): void {
+    const injected = process.env.RUNO_SSH_KEY;
+    if (!injected || existsSync(this.keyPath)) return;
+    mkdirSync(SSH_DIR, { recursive: true });
+    writeFileSync(this.keyPath, injected.endsWith("\n") ? injected : `${injected}\n`, {
+      mode: 0o600,
+    });
+    const pub = Bun.spawnSync(["ssh-keygen", "-y", "-f", this.keyPath], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (pub.exitCode !== 0)
+      throw new RunoError(
+        `RUNO_SSH_KEY is not a usable private key: ${pub.stderr.toString().trim()}`,
+        "Pass the full private key, newlines included",
+      );
+    writeFileSync(`${this.keyPath}.pub`, pub.stdout.toString());
+  }
+
   private target(rt: Runtime): SshTarget {
+    this.materializeInjectedKey();
     if (!rt.ip)
       throw new RunoError(
         `Environment ${rt.name ?? rt.id} has no public IP (state: ${rt.state})`,
@@ -92,22 +118,7 @@ export class Ec2Provider implements RuntimeProvider {
     // CI runner has no ~/.runo, so without this every job would generate a new
     // key, re-import the AWS keypair, and lock itself out of the environment
     // the previous job created for the same branch.
-    const injected = process.env.RUNO_SSH_KEY;
-    if (injected && !existsSync(this.keyPath)) {
-      writeFileSync(this.keyPath, injected.endsWith("\n") ? injected : `${injected}\n`, {
-        mode: 0o600,
-      });
-      const pub = Bun.spawnSync(["ssh-keygen", "-y", "-f", this.keyPath], {
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-      if (pub.exitCode !== 0)
-        throw new RunoError(
-          `RUNO_SSH_KEY is not a usable private key: ${pub.stderr.toString().trim()}`,
-          "Pass the full private key, newlines included",
-        );
-      writeFileSync(pubPath, pub.stdout.toString());
-    }
+    this.materializeInjectedKey();
     if (!existsSync(this.keyPath)) {
       const gen = Bun.spawnSync(
         ["ssh-keygen", "-t", "ed25519", "-N", "", "-C", this.keyName, "-f", this.keyPath],

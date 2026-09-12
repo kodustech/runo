@@ -1,6 +1,5 @@
 import path from "node:path";
 import { mkdirSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { HASH6, SSH_DIR } from "./config";
 
 export interface SshTarget {
@@ -28,10 +27,18 @@ export function shq(s: string): string {
  * the install hash.
  */
 function controlPath(): string {
+  // %C expands to a 40-char hash, and ssh binds the socket at
+  // "<path>.<16 random chars>" before renaming it — both count against the
+  // ~104-byte sun_path limit.
+  const EXPANDED = 40 - "%C".length;
+  const TEMP_SUFFIX = 17;
+  const LIMIT = 104;
   const natural = path.join(SSH_DIR, "cm-%C");
-  if (natural.length + 40 - 2 <= 100) return natural;
-  const dir = path.join(tmpdir(), `runo-${HASH6}`);
-  mkdirSync(dir, { recursive: true });
+  if (natural.length + EXPANDED + TEMP_SUFFIX < LIMIT) return natural;
+  // deliberately /tmp and not tmpdir(): on macOS the per-user temp dir is
+  // itself ~50 bytes, which does not fit either
+  const dir = `/tmp/runo-${HASH6}`;
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
   return path.join(dir, "cm-%C");
 }
 
