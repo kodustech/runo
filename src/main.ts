@@ -690,6 +690,12 @@ async function cmdBake(flags: Flags): Promise<void> {
     prepare: async (rt) => {
       await uploadCode(provider, rt, ctx, remoteDir);
       await runSteps(provider, rt, remoteDir, "setup", ctx.recipe.setup);
+      // files.copy brought untracked files (a .env) onto the bake VM so the
+      // build could run. They must NOT reach the snapshot: the image is shared
+      // by tag, and an image is not a place to keep an environment file.
+      for (const rel of ctx.recipe.filesCopy) {
+        await provider.exec(rt, `rm -f ${shq(`${remoteDir}/${rel}`)}`);
+      }
       if (ctx.recipe.mode === "compose") {
         // pull/build every image the stack needs, WITHOUT starting it: the
         // snapshot should carry layers, not a running database
@@ -783,7 +789,14 @@ async function cmdDestroy(flags: Flags): Promise<void> {
     log.ok("runo destroy --all: instances, keypair and security group removed");
     return;
   }
+  // Tearing down something that is already gone is the goal, not an error:
+  // CI calls this on every closed PR, including ones that never got an env.
+  // Anything else — a broken key, a throttled API — must still fail loudly.
   const env = flags.branch ? await resolveOrAdopt(flags.branch) : resolveEnv({});
+  if (!env) {
+    log.ok(`no environment for ${flags.branch} — nothing to destroy`);
+    return;
+  }
   await destroyOne(env);
 }
 
@@ -792,7 +805,7 @@ async function cmdDestroy(flags: Flags): Promise<void> {
  * preview down from a fresh runner whose registry is empty. Fall back to the
  * instance's own tags before giving up.
  */
-async function resolveOrAdopt(branch: string): Promise<EnvRecord> {
+async function resolveOrAdopt(branch: string): Promise<EnvRecord | null> {
   try {
     return resolveEnv({ branch });
   } catch (notRegistered) {
@@ -801,7 +814,7 @@ async function resolveOrAdopt(branch: string): Promise<EnvRecord> {
     const provider = getProvider("aws");
     await provider.preflight();
     const rt = await provider.findByTags?.(repoName, branch);
-    if (!rt) throw notRegistered;
+    if (!rt) return null;
     const slug = slugify(branch);
     log.step(`no local record for ${branch} — adopting ${rt.id} by tag`);
     return {
