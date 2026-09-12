@@ -8,11 +8,18 @@ import type { Runtime, RuntimeProvider } from "../provider/types";
 import { registry, urlsFor, type EnvRecord } from "../registry";
 import { shq } from "../ssh";
 import { git, type EnvContext } from "./context";
-import { composePrefix, healthcheckPublic, probeServices, startServices, waitInternalPorts } from "./services";
+import { getExpose } from "../expose";
+import { composePrefix, healthcheckPublic, planServices, probeServices, startServices, waitInternalPorts } from "./services";
 
 /** Tooling that cloud-init must have left ready on the VM. */
 const TOOLING_CHECK =
   "docker --version && docker compose version && git --version && tmux -V && rsync --version | head -1 && node --version && bun --version && pnpm --version && claude --version && codex --version";
+
+/** The recipe path as the repo sees it, so another machine can load the same one. */
+function recipeRelative(ctx: EnvContext): string {
+  const rel = path.relative(ctx.worktree, ctx.recipePath);
+  return rel.startsWith("..") ? ctx.recipePath : rel;
+}
 
 function baseRecord(ctx: EnvContext): EnvRecord {
   return (
@@ -170,14 +177,27 @@ async function finishUp(
   opts: { runData: boolean },
 ): Promise<EnvRecord> {
   const remoteDir = remoteRepoDir(ctx.repoName);
-  const plan = await startServices(provider, rt, ctx.recipe, remoteDir);
-  await provider.ensurePorts(plan.publicServices.map((s) => s.port));
+  const plan = await planServices(provider, rt, ctx.recipe, remoteDir);
+
+  // expose BEFORE the services boot: an app that emits absolute links (auth
+  // callbacks, a frontend calling its own API) needs its public address in the
+  // environment it starts with — see composePrefix's ${RUNO_PUBLIC_URL}.
+  const expose = getExpose(ctx.recipe);
+  const urls = await expose.up({
+    provider,
+    rt,
+    envName: ctx.envName,
+    slug: ctx.slug,
+    services: plan.publicServices.map((s, i) => ({ name: s.name, port: s.port, primary: i === 0 })),
+  });
+
+  await startServices(provider, rt, ctx.recipe, remoteDir, plan, urls);
   await waitInternalPorts(provider, rt, plan.internalPorts);
   if (opts.runData) {
     const data = [ctx.recipe.data.migrate, ctx.recipe.data.seed].filter(Boolean) as string[];
     await runSteps(provider, rt, remoteDir, "data", data, { retries: 2 });
   }
-  await healthcheckPublic(provider, rt, ctx.recipe, remoteDir, plan.publicServices);
+  await healthcheckPublic(provider, rt, ctx.recipe, remoteDir, plan.publicServices, urls);
 
   // idle auto-suspend (the on-VM watchdog reads /etc/runo/idle-limit)
   const idle = ctx.recipe.limits.idleSuspendSec;
@@ -197,11 +217,13 @@ async function finishUp(
     state: "running",
     materialized: true,
     publicServices: plan.publicServices,
+    recipe: recipeRelative(ctx),
+    exposeMode: ctx.recipe.expose.mode,
+    urls,
     lastUpAt: new Date().toISOString(),
   });
-  const urls = urlsFor(updated, rt.ip);
   log.ok(`environment ${ctx.envName} is up`);
-  for (const [svc, url] of Object.entries(urls)) console.log(`  ${svc}: ${url}`);
+  for (const [svc, url] of Object.entries(urlsFor(updated, rt.ip))) console.log(`  ${svc}: ${url}`);
   return updated;
 }
 
@@ -215,6 +237,26 @@ export async function upEnv(ctx: EnvContext): Promise<EnvRecord> {
 
   let env = baseRecord(ctx);
   let rt: Runtime | null = null;
+
+  // No local record? The env may still exist — the registry is per machine and
+  // CI runs on a new one every job. The instance's own tags are the source of
+  // truth, so adopt what the branch already has instead of paying for a second
+  // VM (and leaking the first).
+  if (!(env.runtime as any)?.id && provider.findByTags) {
+    const adopted = await provider.findByTags(ctx.repoName, ctx.branch);
+    if (adopted) {
+      log.step(`adopting the existing instance for ${ctx.branch} (${adopted.id}, ${adopted.state})`);
+      env = registry.upsert({
+        ...env,
+        runtime: adopted as unknown as Record<string, unknown>,
+        state: adopted.state === "running" ? "running" : "stopped",
+        // the upload/setup pipeline may or may not have completed on that
+        // instance; finishUp re-checks the repo on disk before reconciling
+        materialized: true,
+      });
+    }
+  }
+
   if (env.runtime && (env.runtime as any).id) {
     rt = await provider.status(env.runtime as unknown as Runtime);
     if (rt.state === "terminated" || rt.state === "shutting-down" || rt.state === "unknown") {
@@ -318,7 +360,7 @@ export async function resumeEnv(ctx: EnvContext): Promise<EnvRecord> {
   await provider.waitReady(rt);
 
   // hot return from hibernation? services already answering = restart nothing
-  if (await probeServices(rt, env.publicServices)) {
+  if (await probeServices(rt, env.publicServices, env.urls ?? {})) {
     log.ok("services already hot (hibernation resume) — nothing to restart");
     const updated = registry.upsert({
       ...env,

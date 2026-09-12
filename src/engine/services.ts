@@ -1,4 +1,5 @@
 import { mkdirSync, writeFileSync } from "node:fs";
+import { lookup } from "node:dns/promises";
 import path from "node:path";
 import { stringify } from "yaml";
 import { REMOTE_RUNO_DIR, TMP_DIR } from "../config";
@@ -21,19 +22,46 @@ export function tmuxSession(svc: string): string {
   return `runo-${svc}`;
 }
 
+function envVarName(prefix: string, service: string): string {
+  return `${prefix}${service.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}`;
+}
+
+/** Strips the scheme (and any trailing slash) — apps usually want a bare host. */
+function hostOf(url: string): string {
+  return url.replace(/^https?:\/\//, "").replace(/\/+$/, "");
+}
+
 /**
  * docker compose prefix for passthrough mode: env vars for interpolation
- * (with ${RUNO_PUBLIC_IP} substituted), -f overlays in order, profiles.
+ * (with ${RUNO_PUBLIC_IP} / ${RUNO_PUBLIC_URL} substituted), -f overlays in
+ * order, profiles.
+ *
+ * The URL vars are why expose runs BEFORE `compose up`: an app that has to
+ * emit absolute links (auth callbacks, a frontend calling its own API) needs
+ * its public address in the environment it boots with.
  */
-export function composePrefix(recipe: NormalizedRecipe, publicIp?: string | null): string {
+export function composePrefix(
+  recipe: NormalizedRecipe,
+  publicIp?: string | null,
+  urls: Record<string, string> = {},
+  primary?: string,
+): string {
   const c = recipe.compose!;
+  const primaryUrl = (primary && urls[primary]) ?? Object.values(urls)[0] ?? "";
   const env = Object.entries(c.env ?? {})
     .map(([k, v]) => {
-      const val = v
+      let val = v
         .replaceAll("${RUNO_PUBLIC_IP}", publicIp ?? "")
         // dashed form for wildcard-DNS services (nip.io/sslip.io) where dotted
         // IPs are ambiguous next to other numeric labels
-        .replaceAll("${RUNO_PUBLIC_IP_DASHED}", (publicIp ?? "").replaceAll(".", "-"));
+        .replaceAll("${RUNO_PUBLIC_IP_DASHED}", (publicIp ?? "").replaceAll(".", "-"))
+        .replaceAll("${RUNO_PUBLIC_URL}", primaryUrl)
+        .replaceAll("${RUNO_PUBLIC_HOST}", primaryUrl ? hostOf(primaryUrl) : "");
+      for (const [svc, url] of Object.entries(urls)) {
+        val = val
+          .replaceAll(`\${${envVarName("RUNO_URL_", svc)}}`, url)
+          .replaceAll(`\${${envVarName("RUNO_HOST_", svc)}}`, hostOf(url));
+      }
       return `${k}=${shq(val)} `;
     })
     .join("");
@@ -58,7 +86,35 @@ function generatedComposeYaml(recipe: NormalizedRecipe): string {
 }
 
 /**
- * Starts the recipe's services ON the VM and returns the port plan.
+ * Resolves WHAT will run and on which ports — starting nothing.
+ *
+ * Split out of startServices because the expose layer (tunnels, DNS) needs the
+ * port plan BEFORE the services boot, and the services need their public URLs
+ * in the environment they boot with.
+ */
+export async function planServices(
+  provider: RuntimeProvider,
+  rt: Runtime,
+  recipe: NormalizedRecipe,
+  remoteDir: string,
+): Promise<ServicePlan> {
+  if (recipe.mode === "compose") return await planCompose(provider, rt, recipe, remoteDir);
+  const publicServices: PublicService[] = Object.entries(recipe.services)
+    .filter(([, s]) => s.public && s.port)
+    .map(([name, s]) => ({
+      name,
+      port: s.port!,
+      health: s.health,
+      healthTimeoutSec: s.healthTimeoutSec,
+    }));
+  const internalPorts = Object.values(recipe.services)
+    .filter((s) => s.port)
+    .map((s) => s.port!);
+  return { publicServices, internalPorts };
+}
+
+/**
+ * Starts the recipe's services ON the VM.
  * Idempotent — used by up, resume and reconcile.
  */
 export async function startServices(
@@ -66,8 +122,10 @@ export async function startServices(
   rt: Runtime,
   recipe: NormalizedRecipe,
   remoteDir: string,
-): Promise<ServicePlan> {
-  if (recipe.mode === "compose") return await startComposePassthrough(provider, rt, recipe, remoteDir);
+  plan: ServicePlan,
+  urls: Record<string, string> = {},
+): Promise<void> {
+  if (recipe.mode === "compose") return await composeUp(provider, rt, recipe, remoteDir, plan, urls);
 
   const imageSvcs = Object.entries(recipe.services).filter(([, s]) => s.image);
   const runSvcs = Object.entries(recipe.services).filter(([, s]) => s.run);
@@ -100,7 +158,9 @@ export async function startServices(
 
   for (const [name, svc] of runSvcs) {
     log.step(`starting service "${name}" (tmux): ${svc.run}`);
-    const envExports = Object.entries(svc.env ?? {})
+    // the env's own public URLs are exported too, so a process service can
+    // build absolute links without knowing how it was exposed
+    const envExports = Object.entries({ ...urlEnv(urls, plan), ...(svc.env ?? {}) })
       .map(([k, v]) => `export ${k}=${shq(v)}; `)
       .join("");
     const inner = `cd ${shq(remoteDir)} && ${envExports}exec ${svc.run}`;
@@ -113,17 +173,26 @@ export async function startServices(
     if (r.exitCode !== 0)
       throw new RunoError(`Failed to start service "${name}" via tmux: ${r.stderr.trim()}`);
   }
-
-  const publicServices: PublicService[] = Object.entries(recipe.services)
-    .filter(([, s]) => s.public && s.port)
-    .map(([name, s]) => ({ name, port: s.port!, health: s.health, healthTimeoutSec: s.healthTimeoutSec }));
-  const internalPorts = Object.values(recipe.services)
-    .filter((s) => s.port)
-    .map((s) => s.port!);
-  return { publicServices, internalPorts };
 }
 
-async function startComposePassthrough(
+/** RUNO_PUBLIC_URL / RUNO_URL_<SERVICE> for non-compose (process) services. */
+function urlEnv(urls: Record<string, string>, plan: ServicePlan): Record<string, string> {
+  const out: Record<string, string> = {};
+  const primary = plan.publicServices[0]?.name;
+  const primaryUrl = (primary && urls[primary]) ?? Object.values(urls)[0];
+  if (primaryUrl) {
+    out.RUNO_PUBLIC_URL = primaryUrl;
+    out.RUNO_PUBLIC_HOST = hostOf(primaryUrl);
+  }
+  for (const [svc, url] of Object.entries(urls)) {
+    out[envVarName("RUNO_URL_", svc)] = url;
+    out[envVarName("RUNO_HOST_", svc)] = hostOf(url);
+  }
+  return out;
+}
+
+/** Resolves the effective compose ON the VM and maps public services to ports. */
+async function planCompose(
   provider: RuntimeProvider,
   rt: Runtime,
   recipe: NormalizedRecipe,
@@ -131,10 +200,9 @@ async function startComposePassthrough(
 ): Promise<ServicePlan> {
   const c = recipe.compose!;
   const filesLabel = c.files.join(" + ");
-  const prefix = composePrefix(recipe, rt.ip);
-
-  // Resolve the effective compose ON the VM (interpolation uses the uploaded .env)
-  const cfg = await provider.exec(rt, `${prefix} config --format json`, {
+  // interpolation uses the uploaded .env; URLs are not known yet and are not
+  // needed to resolve the port map
+  const cfg = await provider.exec(rt, `${composePrefix(recipe, rt.ip)} config --format json`, {
     cwd: remoteDir,
     timeoutMs: 120_000,
   });
@@ -156,24 +224,63 @@ async function startComposePassthrough(
       .map((p: any) => Number(p.published))
       .filter((n: number) => Number.isFinite(n) && n > 0);
 
-  let publicName = c.public;
-  if (!publicName) {
-    publicName = Object.keys(services).find((n) => publishedOf(services[n]).length > 0);
-    if (publicName) log.warn(`recipe has no "public:" — using "${publicName}" as the public service`);
+  let names = [...c.public];
+  if (names.length === 0) {
+    const inferred = Object.keys(services).find((n) => publishedOf(services[n]).length > 0);
+    if (inferred) {
+      log.warn(`recipe has no "public:" — using "${inferred}" as the public service`);
+      names = [inferred];
+    }
   }
-  if (!publicName || !services[publicName])
+  if (names.length === 0)
     throw new RunoError(
-      `Public service "${c.public ?? "?"}" does not exist in the effective compose (${filesLabel})`,
-      `Available services: ${Object.keys(services).join(", ")}`,
+      `No public service resolved from ${filesLabel}`,
+      `Set services.compose.public — available services: ${Object.keys(services).join(", ")}`,
     );
-  const publicPorts = publishedOf(services[publicName]);
-  if (publicPorts.length === 0)
-    throw new RunoError(`Public service "${publicName}" publishes no ports in ${filesLabel}`);
-  const publicPort = c.port ?? publicPorts[0]!;
-  if (c.port && !publicPorts.includes(c.port))
-    log.warn(`public_port ${c.port} is not among ${publicName}'s published ports — proceeding anyway`);
 
-  log.step(`starting the repo's compose (${filesLabel}${c.profiles.length ? `, profiles: ${c.profiles.join(",")}` : ""}) — the first up builds images and can take a while…`);
+  const publicServices: PublicService[] = names.map((name, idx) => {
+    if (!services[name])
+      throw new RunoError(
+        `Public service "${name}" does not exist in the effective compose (${filesLabel})`,
+        `Available services: ${Object.keys(services).join(", ")}`,
+      );
+    const ports = publishedOf(services[name]);
+    if (ports.length === 0)
+      throw new RunoError(`Public service "${name}" publishes no ports in ${filesLabel}`);
+    const primary = idx === 0;
+    const port = primary && c.port ? c.port : ports[0]!;
+    if (primary && c.port && !ports.includes(c.port))
+      log.warn(`public_port ${c.port} is not among ${name}'s published ports — proceeding anyway`);
+    // health: only the primary carries the recipe's HTTP path; the others are
+    // checked for "answers at all"
+    return {
+      name,
+      port,
+      health: primary ? c.health : undefined,
+      healthTimeoutSec: primary ? c.healthTimeoutSec : c.healthTimeoutSec,
+    };
+  });
+
+  // with an explicit public_port, skip sweeping every published port (a
+  // shared-netns service can publish dozens; docker-proxy binds them instantly)
+  const internalPorts = c.port ? [c.port] : Object.values(services).flatMap((s) => publishedOf(s));
+  return { publicServices, internalPorts };
+}
+
+async function composeUp(
+  provider: RuntimeProvider,
+  rt: Runtime,
+  recipe: NormalizedRecipe,
+  remoteDir: string,
+  plan: ServicePlan,
+  urls: Record<string, string>,
+): Promise<void> {
+  const c = recipe.compose!;
+  const filesLabel = c.files.join(" + ");
+  const prefix = composePrefix(recipe, rt.ip, urls, plan.publicServices[0]?.name);
+  log.step(
+    `starting the repo's compose (${filesLabel}${c.profiles.length ? `, profiles: ${c.profiles.join(",")}` : ""}) — the first up builds images and can take a while…`,
+  );
   const up = await provider.exec(rt, `${prefix} up -d`, {
     cwd: remoteDir,
     stream: true,
@@ -184,16 +291,6 @@ async function startComposePassthrough(
       `docker compose up failed (${filesLabel})`,
       `Check the logs: runo logs — or on the VM: ${filesLabel}`,
     );
-
-  // with an explicit public_port, skip sweeping every published port (a
-  // shared-netns service can publish dozens; docker-proxy binds them instantly)
-  const internalPorts = c.port ? [c.port] : Object.values(services).flatMap((s) => publishedOf(s));
-  return {
-    publicServices: [
-      { name: publicName, port: publicPort, health: c.health, healthTimeoutSec: c.healthTimeoutSec },
-    ],
-    internalPorts,
-  };
 }
 
 /** Waits for ports to answer ON the VM (via nc local to the VM). */
@@ -214,6 +311,16 @@ export async function waitInternalPorts(
         `Port ${port} did not answer on the VM within 120s`,
         "Check the service logs with `runo logs <service>`",
       );
+  }
+}
+
+/** Does this machine's resolver know the name at all? */
+async function resolves(host: string): Promise<boolean> {
+  try {
+    await lookup(host);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -254,13 +361,30 @@ async function tcpOk(host: string, port: number, timeoutMs = 5000): Promise<bool
   });
 }
 
-async function httpOk(url: string, timeoutMs = 5000): Promise<boolean> {
+async function httpOk(url: string, timeoutMs = 5000, anyStatus = false): Promise<boolean> {
   try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
-    return res.status >= 200 && res.status < 300;
+    const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs), redirect: "manual" });
+    // A service with no declared health path only has to prove it is THERE:
+    // a 302 to /sign-in or a 404 still means the request reached the app
+    // (and, in tunnel mode, that the whole tunnel path works).
+    return anyStatus ? res.status < 500 : res.status >= 200 && res.status < 300;
   } catch {
     return false;
   }
+}
+
+/** Where to reach a service from outside: its expose URL, else the raw IP. */
+function externalTarget(
+  svc: PublicService,
+  ip: string | null,
+  urls: Record<string, string>,
+): { url: string | null; label: string; anyStatus: boolean } {
+  const base = urls[svc.name];
+  const suffix = svc.health ? (svc.health.startsWith("/") ? svc.health : `/${svc.health}`) : "/";
+  if (base) return { url: `${base.replace(/\/+$/, "")}${suffix}`, label: `${base}${svc.health ? suffix : ""}`, anyStatus: !svc.health };
+  if (!ip) return { url: null, label: `${svc.name} (no address)`, anyStatus: !svc.health };
+  if (svc.health) return { url: `http://${ip}:${svc.port}${suffix}`, label: `http://${ip}:${svc.port}${suffix}`, anyStatus: false };
+  return { url: null, label: `${ip}:${svc.port} (TCP)`, anyStatus: false }; // TCP probe
 }
 
 /**
@@ -270,16 +394,20 @@ async function httpOk(url: string, timeoutMs = 5000): Promise<boolean> {
 export async function probeServices(
   rt: Runtime,
   publicServices: PublicService[],
+  urls: Record<string, string> = {},
   timeoutMs = 20_000,
 ): Promise<boolean> {
-  if (publicServices.length === 0 || !rt.ip) return false;
+  if (publicServices.length === 0) return false;
   const deadline = Date.now() + timeoutMs;
   const pending = new Set(publicServices);
   while (Date.now() < deadline && pending.size > 0) {
     for (const svc of [...pending]) {
-      const ok = svc.health
-        ? await httpOk(`http://${rt.ip}:${svc.port}${svc.health.startsWith("/") ? svc.health : `/${svc.health}`}`, 4000)
-        : await tcpOk(rt.ip, svc.port, 4000);
+      const t = externalTarget(svc, rt.ip, urls);
+      const ok = t.url
+        ? await httpOk(t.url, 4000, t.anyStatus)
+        : rt.ip
+          ? await tcpOk(rt.ip, svc.port, 4000)
+          : false;
       if (ok) pending.delete(svc);
     }
     if (pending.size > 0) await sleep(2000);
@@ -297,29 +425,41 @@ export async function healthcheckPublic(
   recipe: NormalizedRecipe,
   remoteDir: string,
   publicServices: PublicService[],
+  urls: Record<string, string> = {},
 ): Promise<void> {
   for (const svc of publicServices) {
     const timeoutSec = svc.healthTimeoutSec ?? 120;
-    const target = svc.health
-      ? `http://${rt.ip}:${svc.port}${svc.health.startsWith("/") ? svc.health : `/${svc.health}`}`
-      : `${rt.ip}:${svc.port} (TCP)`;
-    log.step(`external health check for "${svc.name}" → ${target} (timeout ${timeoutSec}s)`);
+    const t = externalTarget(svc, rt.ip, urls);
+    log.step(`external health check for "${svc.name}" → ${t.label} (timeout ${timeoutSec}s)`);
     const deadline = Date.now() + timeoutSec * 1000;
     let ok = false;
     while (Date.now() < deadline && !ok) {
-      ok = svc.health
-        ? await httpOk(`http://${rt.ip}:${svc.port}${svc.health.startsWith("/") ? svc.health : `/${svc.health}`}`)
-        : await tcpOk(rt.ip!, svc.port);
+      ok = t.url ? await httpOk(t.url, 5000, t.anyStatus) : await tcpOk(rt.ip!, svc.port);
       if (!ok) await sleep(3000);
     }
     if (!ok) {
+      // A tunnel hostname that does not resolve HERE is not a broken env:
+      // resolvers routinely blackhole *.trycloudflare.com (quick tunnels are
+      // abused for phishing, so filters block the whole zone). Say that
+      // instead of dumping app logs that show a perfectly healthy service.
+      const exposeUrl = urls[svc.name];
+      if (exposeUrl) {
+        const host = hostOf(exposeUrl).split("/")[0]!;
+        if (!(await resolves(host)))
+          throw new RunoError(
+            `"${svc.name}" is up on the VM, but ${host} does not resolve from this machine`,
+            "Your DNS resolver is blocking the tunnel domain. Check with `dig @1.1.1.1 " +
+              host +
+              "` — if that answers, use a named tunnel (recipe `expose.domain`) on a domain your network trusts.",
+          );
+      }
       const tail = await serviceLogTail(provider, rt, recipe, remoteDir, svc.name);
       throw new RunoError(
-        `Health check for "${svc.name}" failed after ${timeoutSec}s (${target})`,
+        `Health check for "${svc.name}" failed after ${timeoutSec}s (${t.label})`,
         tail ? `Last log lines:\n${tail}` : "See `runo logs`",
       );
     }
-    log.ok(`"${svc.name}" answering at http://${rt.ip}:${svc.port}`);
+    log.ok(`"${svc.name}" answering at ${urls[svc.name] ?? `http://${rt.ip}:${svc.port}`}`);
   }
 }
 

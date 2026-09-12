@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { AGENT_ENV_PATH, RUNO_HOME, REMOTE_RUNO_DIR, TMP_DIR, remoteRepoDir } from "./config";
+import { AGENT_ENV_PATH, RUNO_HOME, REMOTE_RUNO_DIR, TMP_DIR, envNameFor, remoteRepoDir } from "./config";
 import { requireAgentEnv, resolveAgentEnv } from "./agentAuth";
 import { RunoError } from "./errors";
 import { fmtDuration, log } from "./log";
@@ -105,6 +105,11 @@ function parseFlags(args: string[]): Flags {
     } else if (a === "--branch" || a === "-b") {
       f.branch = args[++i];
       if (!f.branch) throw new RunoError("--branch requires a value");
+    } else if (a === "--recipe") {
+      const rel = args[++i];
+      if (!rel) throw new RunoError("--recipe requires a path (e.g. .kodus/workspace.preview.yaml)");
+      // read by loadRecipe wherever a context is built
+      process.env.RUNO_RECIPE = rel;
     } else if (a === "--force") f.force = true;
     else if (a === "--restart") f.restart = true;
     else if (a === "--rm") f.rm = true;
@@ -283,7 +288,9 @@ async function cmdUp(flags: Flags): Promise<void> {
   if (flags.here) {
     // the current working tree (e.g. an Orca worktree) IS the sync anchor
     const repo = requireRepo();
-    const branch = currentBranch(repo);
+    // --branch is required on a detached HEAD, which is exactly what CI hands
+    // us when it checks out a pull request by sha
+    const branch = flags.branch ?? currentBranch(repo);
     const existing = registry.findByRepoBranch(repo, branch);
     ctx = existing ? contextFromEnv(existing) : buildContextHere(repo, branch);
   } else if (byCwd && !flags.branch) {
@@ -496,8 +503,10 @@ async function cmdPush(flags: Flags): Promise<void> {
   if (flags.restart) {
     const ctx = contextFromEnv(env);
     log.step("restarting services…");
-    const { startServices } = await import("./engine/services");
-    await startServices(provider, rt, ctx.recipe, remoteRepoDir(env.repo));
+    const { planServices, startServices } = await import("./engine/services");
+    const remoteDir = remoteRepoDir(env.repo);
+    const plan = await planServices(provider, rt, ctx.recipe, remoteDir);
+    await startServices(provider, rt, ctx.recipe, remoteDir, plan, env.urls ?? {});
   }
   log.ok(
     `push complete${flags.restart ? " (services restarted)" : " — compose dev with watch reloads by itself; use --restart for run: services"}`,
@@ -676,12 +685,34 @@ async function cmdPool(flags: Flags): Promise<void> {
   log.ok(`warm pool adjusted to ${target} instance(s)`);
 }
 
+async function terminate(env: EnvRecord, provider: ReturnType<typeof getProvider>): Promise<void> {
+  if (!(env.runtime as any)?.id) return;
+  log.step(`terminating instance for ${env.name}…`);
+  await provider.destroy(env.runtime as unknown as Runtime);
+}
+
 async function destroyOne(env: EnvRecord): Promise<void> {
   const provider = getProvider(env.provider);
+  // Release what the expose layer owns OUTSIDE the VM (a named tunnel and its
+  // DNS records outlive the instance) before the instance goes away. The mode
+  // comes from the recipe rather than the record: an env adopted by tag has no
+  // record to read, and that is exactly the CI teardown path.
   if ((env.runtime as any)?.id) {
-    log.step(`terminating instance for ${env.name}…`);
-    await provider.destroy(env.runtime as unknown as Runtime);
+    try {
+      const { getExpose } = await import("./expose");
+      const ctx = contextFromEnv(env);
+      if (ctx.recipe.expose.mode !== "ip")
+        await getExpose(ctx.recipe).down({
+          provider,
+          rt: env.runtime as unknown as Runtime,
+          envName: env.name,
+          slug: env.slug,
+        });
+    } catch (e: any) {
+      log.warn(`could not release the env's public entry point: ${e?.message ?? e}`);
+    }
   }
+  await terminate(env, provider);
   if (env.externalWorktree) {
     registry.remove(env.name);
     log.ok(`${env.name} destroyed (instance + registry; external worktree kept)`);
@@ -707,8 +738,43 @@ async function cmdDestroy(flags: Flags): Promise<void> {
     log.ok("runo destroy --all: instances, keypair and security group removed");
     return;
   }
-  const env = resolveEnv({ branch: flags.branch });
+  const env = flags.branch ? await resolveOrAdopt(flags.branch) : resolveEnv({});
   await destroyOne(env);
+}
+
+/**
+ * Destroy has to work from a machine that never created the env: CI tears a
+ * preview down from a fresh runner whose registry is empty. Fall back to the
+ * instance's own tags before giving up.
+ */
+async function resolveOrAdopt(branch: string): Promise<EnvRecord> {
+  try {
+    return resolveEnv({ branch });
+  } catch (notRegistered) {
+    const repoPath = requireRepo();
+    const repoName = path.basename(repoPath);
+    const provider = getProvider("aws");
+    await provider.preflight();
+    const rt = await provider.findByTags?.(repoName, branch);
+    if (!rt) throw notRegistered;
+    const slug = slugify(branch);
+    log.step(`no local record for ${branch} — adopting ${rt.id} by tag`);
+    return {
+      name: rt.name ?? envNameFor(slug),
+      repo: repoName,
+      repoPath,
+      branch,
+      slug,
+      worktree: repoPath,
+      externalWorktree: true, // never touch a directory this machine did not create
+      provider: "aws",
+      runtime: rt as unknown as Record<string, unknown>,
+      state: rt.state === "running" ? "running" : "stopped",
+      publicServices: [],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+  }
 }
 
 // ---------------- dispatch ----------------

@@ -1,7 +1,7 @@
 import path from "node:path";
 import { WORKTREES_DIR, envNameFor, slugify } from "../config";
 import { RunoError } from "../errors";
-import { loadRecipe, type NormalizedRecipe } from "../recipe";
+import { loadRecipe, loadRecipeFrom, type NormalizedRecipe } from "../recipe";
 import { registry, type EnvRecord } from "../registry";
 
 export function git(cwd: string, ...args: string[]): { exitCode: number; stdout: string; stderr: string } {
@@ -74,7 +74,7 @@ export function buildContextHere(worktreePath: string, branch: string): EnvConte
 }
 
 export function contextFromEnv(env: EnvRecord): EnvContext {
-  const { recipe, path: recipePath } = loadRecipe(env.worktree, env.repoPath);
+  const { recipe, path: recipePath } = loadRecipeFrom(env.recipe, [env.worktree, env.repoPath]);
   return {
     repoPath: env.repoPath,
     repoName: env.repo,

@@ -17,10 +17,32 @@ export interface ComposeDef {
   files: string[]; // yaml: file (string) or files (list) — overlay order preserved
   profiles: string[];
   env?: Record<string, string>; // interpolation vars; ${RUNO_PUBLIC_IP} is substituted at up time
-  public?: string; // service whose published port becomes the public URL
-  port?: number; // yaml: public_port — explicit public port when the service publishes many
+  public: string[]; // services whose published ports become public URLs (first = primary)
+  port?: number; // yaml: public_port — explicit port for the primary service when it publishes many
   health?: string; // HTTP path on the public service
   healthTimeoutSec?: number; // yaml: health_timeout (default 120; heavy apps need more on first boot)
+}
+
+export interface ExposeDef {
+  /**
+   * How the env is reachable from outside.
+   * - "https": Caddy + sslip.io — real certificate on the VM's IP, zero setup
+   * - "tunnel": Cloudflare Tunnel — no inbound port at all; add `domain` for a
+   *   hostname that survives suspend/resume
+   * - "ip": plain http://<ip>:<port>, the original behavior (still the default
+   *   for recipes written before expose existed)
+   */
+  mode: "ip" | "https" | "tunnel";
+  /**
+   * Zone-owned domain for named tunnels ("preview.acme.com"): the env keeps
+   * ONE hostname across suspend/resume, which is what a link in a PR needs.
+   * Without it, tunnels are Cloudflare's zero-setup quick tunnels — free and
+   * credential-less, but the hostname is random and many corporate resolvers
+   * blackhole *.trycloudflare.com.
+   */
+  domain?: string;
+  /** Hostname label under `domain` (default: the env slug). ${RUNO_SLUG} allowed. */
+  hostname?: string;
 }
 
 export interface NormalizedRecipe {
@@ -32,6 +54,7 @@ export interface NormalizedRecipe {
   compose?: ComposeDef;
   data: { migrate?: string; seed?: string };
   validate: { name: string; run: string }[];
+  expose: ExposeDef;
   limits: { instance: string; diskGb: number; idleSuspendSec: number; spot: boolean }; // idle 0 = auto-suspend off
 }
 
@@ -86,6 +109,22 @@ export function parseRecipe(yamlText: string, source: string): NormalizedRecipe 
     idleSuspendSec = Number(m[1]) * (m[2] === "h" ? 3600 : m[2] === "m" ? 60 : 1);
   }
 
+  const exposeMode = String(raw.expose?.mode ?? "ip").toLowerCase();
+  if (!["ip", "https", "tunnel"].includes(exposeMode))
+    throw new RunoError(
+      `Invalid recipe (${source}): expose.mode "${exposeMode}" — use "https", "tunnel" or "ip"`,
+    );
+  const exposeDomain = raw.expose?.domain ? String(raw.expose.domain).trim() : undefined;
+  if (exposeDomain && exposeMode !== "tunnel")
+    throw new RunoError(
+      `Invalid recipe (${source}): expose.domain requires expose.mode "tunnel"`,
+    );
+  const expose: ExposeDef = {
+    mode: exposeMode as ExposeDef["mode"],
+    domain: exposeDomain,
+    hostname: raw.expose?.hostname ? String(raw.expose.hostname).trim() : undefined,
+  };
+
   const limits = {
     instance: String(raw.limits?.instance ?? "t3.medium"),
     diskGb: Number(diskMatch[1]),
@@ -108,6 +147,18 @@ export function parseRecipe(yamlText: string, source: string): NormalizedRecipe 
         : [];
     if (files.length === 0)
       throw new RunoError(`Invalid recipe (${source}): services.compose needs "file" or "files"`);
+    // public: one service or a list — every entry gets a URL, the first one is
+    // the env's primary entry point (runo url prints it first)
+    const publicNames: string[] = Array.isArray(c.public)
+      ? c.public.map(String)
+      : c.public
+        ? [String(c.public)]
+        : [];
+    if (c.public_port !== undefined && publicNames.length > 1)
+      throw new RunoError(
+        `Invalid recipe (${source}): services.compose.public_port cannot be used with a list of public services`,
+        "Each service's published port is resolved from the compose file",
+      );
     return {
       version: 1,
       setup,
@@ -120,13 +171,14 @@ export function parseRecipe(yamlText: string, source: string): NormalizedRecipe 
         env: c.env
           ? Object.fromEntries(Object.entries(c.env).map(([k, v]) => [k, String(v)]))
           : undefined,
-        public: c.public ? String(c.public) : undefined,
+        public: publicNames,
         port: c.public_port !== undefined ? Number(c.public_port) : undefined,
         health: c.health ? String(c.health) : undefined,
         healthTimeoutSec: c.health_timeout !== undefined ? Number(c.health_timeout) : undefined,
       },
       data,
       validate,
+      expose,
       limits,
     };
   }
@@ -157,17 +209,57 @@ export function parseRecipe(yamlText: string, source: string): NormalizedRecipe 
     normalized[name] = svc;
   }
 
-  return { version: 1, setup, filesCopy, mode: "services", services: normalized, data, validate, limits };
+  return {
+    version: 1,
+    setup,
+    filesCopy,
+    mode: "services",
+    services: normalized,
+    data,
+    validate,
+    expose,
+    limits,
+  };
 }
 
-/** Loads the recipe from the first directory that has .kodus/workspace.yaml. */
+/**
+ * Which recipe file to read. One repo can describe more than one kind of
+ * environment — a developer box and a PR preview are not the same machine —
+ * so `--recipe` (RUNO_RECIPE) picks the shape without touching the default.
+ */
+function recipeRelPath(): string {
+  const override = process.env.RUNO_RECIPE?.trim();
+  return override && override.length > 0 ? override : RECIPE_REL_PATH;
+}
+
+/** Loads the recipe from the first directory that has it. */
 export function loadRecipe(...dirs: string[]): { recipe: NormalizedRecipe; path: string } {
+  return loadRecipeFrom(undefined, dirs);
+}
+
+/**
+ * Same, for a caller that knows which recipe this env was built from (the
+ * registry records it): a later `push`/`url` must not silently fall back to
+ * the default recipe and reconcile the env with a different shape.
+ * An explicit --recipe still wins.
+ */
+export function loadRecipeFrom(
+  remembered: string | undefined,
+  dirs: string[],
+): { recipe: NormalizedRecipe; path: string } {
+  const rel = process.env.RUNO_RECIPE?.trim() || remembered || RECIPE_REL_PATH;
+  if (path.isAbsolute(rel)) {
+    if (!existsSync(rel)) throw new RunoError(`Recipe not found: ${rel}`);
+    return { recipe: parseRecipe(readFileSync(rel, "utf8"), rel), path: rel };
+  }
   for (const dir of dirs) {
-    const p = path.join(dir, RECIPE_REL_PATH);
+    const p = path.join(dir, rel);
     if (existsSync(p)) return { recipe: parseRecipe(readFileSync(p, "utf8"), p), path: p };
   }
   throw new RunoError(
-    `No recipe found (${RECIPE_REL_PATH}) in: ${dirs.join(", ")}`,
-    "Run `runo init` at the repo root to generate a proposal",
+    `No recipe found (${rel}) in: ${dirs.join(", ")}`,
+    process.env.RUNO_RECIPE
+      ? "Check the --recipe path (it is relative to the repo root)"
+      : "Run `runo init` at the repo root to generate a proposal",
   );
 }

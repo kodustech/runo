@@ -109,6 +109,12 @@ export interface RuntimeProvider {
   poolStatus(): Promise<Runtime[]>;
   poolScale(target: number): Promise<void>;
 
+  /**
+   * The env's instance located by its tags — lets a machine with no local
+   * registry (a CI runner) find the env its branch already has.
+   */
+  findByTags?(repo: string, branch: string): Promise<Runtime | null>;
+
   /** All runo-managed instances still alive (guardrail + audit). */
   listManaged(): Promise<Runtime[]>;
 
