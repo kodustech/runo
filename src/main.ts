@@ -685,28 +685,34 @@ async function cmdPool(flags: Flags): Promise<void> {
   log.ok(`warm pool adjusted to ${target} instance(s)`);
 }
 
+async function terminate(env: EnvRecord, provider: ReturnType<typeof getProvider>): Promise<void> {
+  if (!(env.runtime as any)?.id) return;
+  log.step(`terminating instance for ${env.name}…`);
+  await provider.destroy(env.runtime as unknown as Runtime);
+}
+
 async function destroyOne(env: EnvRecord): Promise<void> {
   const provider = getProvider(env.provider);
   // Release what the expose layer owns OUTSIDE the VM (a named tunnel and its
-  // DNS records outlive the instance) before the instance goes away.
-  if (env.exposeMode && env.exposeMode !== "ip" && (env.runtime as any)?.id) {
+  // DNS records outlive the instance) before the instance goes away. The mode
+  // comes from the recipe rather than the record: an env adopted by tag has no
+  // record to read, and that is exactly the CI teardown path.
+  if ((env.runtime as any)?.id) {
     try {
       const { getExpose } = await import("./expose");
       const ctx = contextFromEnv(env);
-      await getExpose(ctx.recipe).down({
-        provider,
-        rt: env.runtime as unknown as Runtime,
-        envName: env.name,
-        slug: env.slug,
-      });
+      if (ctx.recipe.expose.mode !== "ip")
+        await getExpose(ctx.recipe).down({
+          provider,
+          rt: env.runtime as unknown as Runtime,
+          envName: env.name,
+          slug: env.slug,
+        });
     } catch (e: any) {
       log.warn(`could not release the env's public entry point: ${e?.message ?? e}`);
     }
   }
-  if ((env.runtime as any)?.id) {
-    log.step(`terminating instance for ${env.name}…`);
-    await provider.destroy(env.runtime as unknown as Runtime);
-  }
+  await terminate(env, provider);
   if (env.externalWorktree) {
     registry.remove(env.name);
     log.ok(`${env.name} destroyed (instance + registry; external worktree kept)`);
