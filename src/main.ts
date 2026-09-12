@@ -75,6 +75,7 @@ interface Flags {
   follow: boolean;
   restart: boolean;
   rm: boolean;
+  warm: boolean;
   here: boolean;
   validate: boolean;
   destroyAfter: boolean;
@@ -90,6 +91,7 @@ function parseFlags(args: string[]): Flags {
     follow: false,
     restart: false,
     rm: false,
+    warm: false,
     here: false,
     validate: false,
     destroyAfter: false,
@@ -113,6 +115,7 @@ function parseFlags(args: string[]): Flags {
     } else if (a === "--force") f.force = true;
     else if (a === "--restart") f.restart = true;
     else if (a === "--rm") f.rm = true;
+    else if (a === "--warm") f.warm = true;
     else if (a === "--here") f.here = true;
     else if (a === "--validate") f.validate = true;
     else if (a === "--destroy") f.destroyAfter = true;
@@ -661,9 +664,51 @@ async function cmdBake(flags: Flags): Promise<void> {
     await provider.removeBootImage();
     return;
   }
-  log.step("baking base image (~10-12min; one-time — serves every env of this install)…");
-  const imageId = await provider.prepareBootImage();
-  log.ok(`base image ready: ${imageId} — subsequent runo up boot in ~1-2min`);
+  if (!flags.warm) {
+    log.step("baking base image (~10-12min; one-time — serves every env of this install)…");
+    const imageId = await provider.prepareBootImage();
+    log.ok(`base image ready: ${imageId} — subsequent runo up boot in ~1-2min`);
+    return;
+  }
+
+  // --warm: also carry the repo's own setup into the image. What a cold
+  // environment spends most of its time on — pulling the base images, building
+  // the app image, installing dependencies — is identical for every branch, so
+  // it belongs in the image, not in each environment.
+  const repoPath = requireRepo();
+  const branch = flags.branch ?? currentBranch(repoPath);
+  const ctx = buildContextHere(repoPath, branch);
+  const remoteDir = remoteRepoDir(ctx.repoName);
+  const { uploadCode, runSteps } = await import("./engine/up");
+  const { composePrefix } = await import("./engine/services");
+
+  log.step(`baking a WARM image for ${ctx.repoName}@${branch} — tooling + ${ctx.recipe.setup.length} setup step(s)`);
+  const imageId = await provider.prepareBootImage({
+    repo: ctx.repoName,
+    instanceType: ctx.recipe.limits.instance,
+    diskGb: ctx.recipe.limits.diskGb,
+    prepare: async (rt) => {
+      await uploadCode(provider, rt, ctx, remoteDir);
+      await runSteps(provider, rt, remoteDir, "setup", ctx.recipe.setup);
+      if (ctx.recipe.mode === "compose") {
+        // pull/build every image the stack needs, WITHOUT starting it: the
+        // snapshot should carry layers, not a running database
+        log.step("pre-pulling and building the compose images…");
+        const prefix = composePrefix(ctx.recipe, null);
+        await provider.exec(rt, `${prefix} pull --ignore-buildable --quiet || true`, {
+          cwd: remoteDir,
+          stream: true,
+          timeoutMs: 30 * 60_000,
+        });
+        await provider.exec(rt, `${prefix} build`, {
+          cwd: remoteDir,
+          stream: true,
+          timeoutMs: 45 * 60_000,
+        });
+      }
+    },
+  });
+  log.ok(`warm image ready: ${imageId} — every env of ${ctx.repoName} now boots with the build already done`);
 }
 
 async function cmdPool(flags: Flags): Promise<void> {

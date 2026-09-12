@@ -41,7 +41,7 @@ function baseRecord(ctx: EnvContext): EnvRecord {
   );
 }
 
-async function uploadCode(
+export async function uploadCode(
   provider: RuntimeProvider,
   rt: Runtime,
   ctx: EnvContext,
@@ -143,7 +143,7 @@ async function uploadCode(
     throw new RunoError(`git init/commit on the VM failed: ${init.stderr.trim()}`);
 }
 
-async function runSteps(
+export async function runSteps(
   provider: RuntimeProvider,
   rt: Runtime,
   remoteDir: string,
@@ -237,19 +237,25 @@ export async function upEnv(ctx: EnvContext): Promise<EnvRecord> {
 
   let env = baseRecord(ctx);
   let rt: Runtime | null = null;
+  // An adopted env carries no proof that the previous run finished — it may
+  // have died mid-migration. Migrations and seeds are idempotent, so re-running
+  // them is cheap insurance; skipping them leaves a half-built environment
+  // (that is exactly how the first CI preview came up without its login).
+  let adopted = false;
 
   // No local record? The env may still exist — the registry is per machine and
   // CI runs on a new one every job. The instance's own tags are the source of
   // truth, so adopt what the branch already has instead of paying for a second
   // VM (and leaking the first).
   if (!(env.runtime as any)?.id && provider.findByTags) {
-    const adopted = await provider.findByTags(ctx.repoName, ctx.branch);
-    if (adopted) {
-      log.step(`adopting the existing instance for ${ctx.branch} (${adopted.id}, ${adopted.state})`);
+    const found = await provider.findByTags(ctx.repoName, ctx.branch);
+    if (found) {
+      log.step(`adopting the existing instance for ${ctx.branch} (${found.id}, ${found.state})`);
+      adopted = true;
       env = registry.upsert({
         ...env,
-        runtime: adopted as unknown as Record<string, unknown>,
-        state: adopted.state === "running" ? "running" : "stopped",
+        runtime: found as unknown as Record<string, unknown>,
+        state: found.state === "running" ? "running" : "stopped",
         // the upload/setup pipeline may or may not have completed on that
         // instance; finishUp re-checks the repo on disk before reconciling
         materialized: true,
@@ -337,7 +343,7 @@ export async function upEnv(ctx: EnvContext): Promise<EnvRecord> {
 
   // ---- reconcile a running env ----
   log.step("environment already exists — reconciling services and health check…");
-  return await finishUp(provider, rt, ctx, env, { runData: false });
+  return await finishUp(provider, rt, ctx, env, { runData: adopted });
 }
 
 /** Instance start + IP redetection + services back up. */

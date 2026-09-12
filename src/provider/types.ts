@@ -100,8 +100,19 @@ export interface RuntimeProvider {
   /**
    * Bakes a base boot image with provisioning done (runo bake) —
    * subsequent ups boot in ~1-2min instead of running full cloud-init.
+   *
+   * `warm` lets the caller do repo-specific work on the bake VM before the
+   * snapshot is taken (upload the code, run the recipe's setup, build images),
+   * so the heavy work that is IDENTICAL for every env happens once per image
+   * instead of once per environment. The provider stays ignorant of recipes:
+   * it only offers the machine and the moment.
    */
-  prepareBootImage(): Promise<string>;
+  prepareBootImage(warm?: {
+    repo: string;
+    instanceType: string;
+    diskGb: number;
+    prepare: (rt: Runtime) => Promise<void>;
+  }): Promise<string>;
   /** Removes the baked base image (runo bake --rm). */
   removeBootImage(): Promise<void>;
 

@@ -233,8 +233,33 @@ export class Ec2Provider implements RuntimeProvider {
     return { amiId, rootDevice: img.Images?.[0]?.RootDeviceName ?? "/dev/sda1" };
   }
 
+  /**
+   * A baked image this account owns for this repo, found by tag. The local
+   * pointer file only exists on the machine that baked it — CI bakes nightly,
+   * and every developer should get that speed-up without re-baking.
+   */
+  private async sharedBakedImage(repo: string): Promise<string | null> {
+    try {
+      const res = await this.ec2.send(
+        new DescribeImagesCommand({
+          Owners: ["self"],
+          Filters: [
+            { Name: "tag:runo:base-image", Values: [repo] },
+            { Name: "state", Values: ["available"] },
+          ],
+        }),
+      );
+      const newest = (res.Images ?? []).sort((a, b) =>
+        (b.CreationDate ?? "").localeCompare(a.CreationDate ?? ""),
+      )[0];
+      return newest?.ImageId ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   /** Baked AMI from runo bake when available; canonical Ubuntu otherwise. */
-  private async resolveAmi(): Promise<{ amiId: string; rootDevice: string; baked: boolean }> {
+  private async resolveAmi(repo?: string): Promise<{ amiId: string; rootDevice: string; baked: boolean }> {
     const baked = this.loadBakedImage();
     if (baked) {
       try {
@@ -245,6 +270,17 @@ export class Ec2Provider implements RuntimeProvider {
       } catch {}
       log.warn(`baked image ${baked.imageId} is no longer available — using the canonical AMI (run runo bake again)`);
       rmSync(this.bakedImagePath, { force: true });
+    }
+    if (repo) {
+      const shared = await this.sharedBakedImage(repo);
+      if (shared) {
+        const img = await this.ec2.send(new DescribeImagesCommand({ ImageIds: [shared] }));
+        const image = img.Images?.[0];
+        if (image?.State === "available") {
+          log.dim(`using the baked image for ${repo} (${shared}) — no local bake needed`);
+          return { amiId: shared, rootDevice: image.RootDeviceName ?? "/dev/sda1", baked: true };
+        }
+      }
     }
     return { ...(await this.canonicalAmi()), baked: false };
   }
@@ -287,8 +323,9 @@ export class Ec2Provider implements RuntimeProvider {
     tags: Tag[];
     sgId: string;
     spot?: boolean;
+    repo?: string;
   }): Promise<string> {
-    const { amiId, rootDevice, baked } = await this.resolveAmi();
+    const { amiId, rootDevice, baked } = await this.resolveAmi(opts.repo);
     if (baked) log.dim(`using baked image ${amiId} (runo bake) — fast boot, no heavy cloud-init`);
     const cloudInitPath = new URL("../../image/cloud-init.yaml", import.meta.url).pathname;
     const userData = baked
@@ -407,6 +444,7 @@ export class Ec2Provider implements RuntimeProvider {
       tags: this.envTags(spec),
       sgId,
       spot: spec.spot,
+      repo: spec.repo,
     });
     log.dim(`instance ${id} created (${spec.instanceType}, ${spec.diskGb}GB gp3, ${AWS_REGION})`);
     return await this.waitForState(id, "running", 5 * 60_000, true);
@@ -776,11 +814,20 @@ export class Ec2Provider implements RuntimeProvider {
 
   // ---------- base image (runo bake) ----------
 
-  async prepareBootImage(): Promise<string> {
+  async prepareBootImage(warm?: {
+    repo: string;
+    instanceType: string;
+    diskGb: number;
+    prepare: (rt: Runtime) => Promise<void>;
+  }): Promise<string> {
     await this.guardrail();
     await this.ensureKeyPair();
     const sgId = await this.ensureSecurityGroup();
     const { amiId, rootDevice } = await this.canonicalAmi();
+    // a warm bake compiles the repo's images, so it needs the machine the repo
+    // asks for, not the small default
+    const bakeType = warm?.instanceType ?? "t3.medium";
+    const bakeDisk = warm?.diskGb ?? 30;
     const cloudInitPath = new URL("../../image/cloud-init.yaml", import.meta.url).pathname;
     const userData = Buffer.from(readFileSync(cloudInitPath, "utf8")).toString("base64");
     const baseTags = [
@@ -788,13 +835,15 @@ export class Ec2Provider implements RuntimeProvider {
       { Key: "runo:managed", Value: "true" },
       { Key: "runo:home-hash", Value: HASH6 },
       { Key: "runo:role", Value: "bake" },
+      // what makes the image findable from another machine (see sharedBakedImage)
+      { Key: "runo:base-image", Value: warm?.repo ?? "generic" },
     ];
 
     log.step("launching a temporary VM to bake the base image (full cloud-init)…");
     const res = await this.ec2.send(
       new RunInstancesCommand({
         ImageId: amiId,
-        InstanceType: "t3.medium",
+        InstanceType: bakeType as any,
         KeyName: this.keyName,
         MinCount: 1,
         MaxCount: 1,
@@ -803,7 +852,7 @@ export class Ec2Provider implements RuntimeProvider {
         BlockDeviceMappings: [
           {
             DeviceName: rootDevice,
-            Ebs: { VolumeSize: 30, VolumeType: "gp3", Iops: 4000, Throughput: 300, DeleteOnTermination: true },
+            Ebs: { VolumeSize: bakeDisk, VolumeType: "gp3", Iops: 4000, Throughput: 300, DeleteOnTermination: true },
           },
         ],
         InstanceInitiatedShutdownBehavior: "stop",
@@ -828,6 +877,14 @@ export class Ec2Provider implements RuntimeProvider {
           "Incomplete tooling on the bake VM — image was NOT created",
           check.stderr.trim().split("\n").pop(),
         );
+      // The expensive, repo-specific half: upload the code and run the
+      // recipe's setup so the image already carries the built images and
+      // installed dependencies. Every environment created from it skips that
+      // work — which is most of a cold boot.
+      if (warm) {
+        log.step("warming the image with the repo's setup (this is the slow part, once)…");
+        await warm.prepare(rt);
+      }
       // clean cloud-init state: the image's next boot re-runs only the
       // essentials (ssh keys/hostname) in seconds
       await this.exec(rt, "sudo cloud-init clean --logs");
@@ -838,7 +895,9 @@ export class Ec2Provider implements RuntimeProvider {
         new CreateImageCommand({
           InstanceId: id,
           Name: `runo-base-${HASH6}-${Date.now()}`,
-          Description: "runo baked base image (docker, node22, bun, pnpm, claude, codex)",
+          Description: warm
+            ? `runo baked image for ${warm.repo} (tooling + the repo's setup already applied)`
+            : "runo baked base image (docker, node22, bun, pnpm, claude, codex)",
           TagSpecifications: [
             { ResourceType: "image", Tags: baseTags },
             { ResourceType: "snapshot", Tags: baseTags },
