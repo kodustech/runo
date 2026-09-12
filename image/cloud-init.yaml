@@ -61,6 +61,10 @@ packages:
   - ca-certificates
   - unzip
   - netcat-openbsd
+  # pnpm's standalone binary (@pnpm/exe, what `packageManager: pnpm@x` pulls)
+  # links against libatomic — without it every `pnpm install` dies with
+  # "libatomic.so.1: cannot open shared object file"
+  - libatomic1
   - docker.io
   - docker-compose-v2
   - docker-buildx
