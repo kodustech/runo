@@ -301,6 +301,11 @@ runo up --here
 
 ## Teams: control plane (v0) — no AWS credentials on laptops
 
+For CI-created previews shared with QA agents, see
+[shared preview setup and migration](docs/shared-previews.md).
+`runo environments` discovers accessible environments, `runo attach <env-name>`
+connects a checkout, and `runo share [user...]` sets collaborators (owner only).
+
 For solo use, the CLI talks to AWS directly with your local credentials. For
 teams, run **runo-server**: it holds the AWS credentials and the SSH keys;
 developers authenticate with a token and need **zero cloud credentials**.

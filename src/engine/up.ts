@@ -209,6 +209,7 @@ async function finishUp(
   await provider.registerServices?.(
     rt,
     plan.publicServices.map((s) => ({ name: s.name, port: s.port })),
+    { recipe: recipeRelative(ctx), urls },
   );
 
   const updated = registry.upsert({

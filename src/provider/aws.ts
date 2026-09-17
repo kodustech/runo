@@ -32,6 +32,7 @@ import { SSMClient, GetParameterCommand } from "@aws-sdk/client-ssm";
 import { STSClient, GetCallerIdentityCommand } from "@aws-sdk/client-sts";
 import { AWS_REGION, HASH6, RUNO_HOME, MAX_INSTANCES, REMOTE_USER, SSH_DIR } from "../config";
 import { RunoError } from "../errors";
+import { verifyIdentity } from "./identity";
 import { log } from "../log";
 import { rsyncPull, rsyncPush, scpUpload, shq, sshBaseArgs, sshCloseMaster, sshExec, sshInteractive, type SshTarget } from "../ssh";
 import type { CreateSpec, ExecOpts, ExecResult, Runtime, RuntimeProvider, RuntimeState } from "./types";
@@ -99,8 +100,10 @@ export class Ec2Provider implements RuntimeProvider {
 
   async preflight(): Promise<void> {
     try {
-      await this.sts.send(new GetCallerIdentityCommand({}));
+      const identity = await this.sts.send(new GetCallerIdentityCommand({}));
+      verifyIdentity(identity.Arn, AWS_REGION, process.env.RUNO_EXPECTED_AWS_ARN, process.env.RUNO_EXPECTED_AWS_REGION);
     } catch (e: any) {
+      if (e instanceof RunoError) throw e;
       throw new RunoError(
         `Invalid or missing AWS credentials (${errCode(e) || e?.message})`,
         "Configure credentials (AWS_PROFILE / aws configure) and confirm with `aws sts get-caller-identity`. Region in use: " +
@@ -225,6 +228,14 @@ export class Ec2Provider implements RuntimeProvider {
   }
 
   private async canonicalAmi(): Promise<{ amiId: string; rootDevice: string }> {
+    // Restricted deployments can pin an EC2 image without granting SSM access.
+    if (process.env.RUNO_AWS_AMI) {
+      const img = await this.ec2.send(new DescribeImagesCommand({ ImageIds: [process.env.RUNO_AWS_AMI] }));
+      const image = img.Images?.[0];
+      if (!image || image.State !== "available" || image.Architecture !== "x86_64")
+        throw new RunoError("RUNO_AWS_AMI must be an available x86_64 image in the configured region");
+      return { amiId: image.ImageId!, rootDevice: image.RootDeviceName ?? "/dev/sda1" };
+    }
     const param = await this.ssm.send(new GetParameterCommand({ Name: AMI_SSM_PARAM }));
     const amiId = param.Parameter?.Value;
     if (!amiId)
@@ -342,7 +353,9 @@ export class Ec2Provider implements RuntimeProvider {
       MinCount: 1,
       MaxCount: 1,
       ...(userData ? { UserData: userData } : {}),
-      NetworkInterfaces: [{ DeviceIndex: 0, AssociatePublicIpAddress: true, Groups: [opts.sgId] }],
+      NetworkInterfaces: [{ DeviceIndex: 0, AssociatePublicIpAddress: true, Groups: [opts.sgId],
+        ...(process.env.RUNO_AWS_SUBNET ? { SubnetId: process.env.RUNO_AWS_SUBNET } : {}),
+      }],
       BlockDeviceMappings: [
         {
           DeviceName: rootDevice,

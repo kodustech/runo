@@ -1,0 +1,28 @@
+#cloud-config
+package_update: true
+packages: [unzip, curl, ca-certificates, git, rsync, caddy]
+write_files:
+  - path: /etc/systemd/system/runo-server.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Runo control plane
+      After=network-online.target
+      Wants=network-online.target
+      [Service]
+      User=ubuntu
+      WorkingDirectory=/opt/runo
+      EnvironmentFile=/etc/runo-server.env
+      EnvironmentFile=/etc/runo-aws.env
+      ExecStart=/home/ubuntu/.bun/bin/bun server/main.ts
+      Restart=on-failure
+      RestartSec=3
+      UMask=0077
+      LimitNOFILE=8192
+      [Install]
+      WantedBy=multi-user.target
+runcmd:
+  - [bash, -lc, 'curl -fsSL https://bun.sh/install | sudo -u ubuntu bash']
+  - [mkdir, -p, /opt/runo, /var/lib/runo-ohio/ssh]
+  - [chown, -R, 'ubuntu:ubuntu', /opt/runo, /var/lib/runo-ohio]
+  - [systemctl, daemon-reload]

@@ -5,6 +5,7 @@ import { requireAgentEnv, resolveAgentEnv } from "./agentAuth";
 import { RunoError } from "./errors";
 import { fmtDuration, log } from "./log";
 import { getProvider } from "./provider";
+import { RemoteProvider } from "./provider/remote";
 import type { Runtime } from "./provider/types";
 import { registry, urlsFor, type EnvRecord } from "./registry";
 import { parseRecipe } from "./recipe";
@@ -57,6 +58,9 @@ Usage: runo <command> [args]
   logs [service] [-f]         remote logs per service
   exec -- <cmd...>            arbitrary command on the VM (cwd in repo)
   ls                          lists environments (state, URL, uptime, instance)
+  environments                lists accessible control-plane environments
+  attach <env-name>            connects this checkout to a shared environment
+  share [user...]              replaces environment collaborators (owner only)
   suspend | resume            stop/start the instance (stopped costs no compute)
   bake [--rm]                 bakes a base image with provisioning done —
                               subsequent runo up boot in ~1-2min (--rm removes)
@@ -148,6 +152,50 @@ async function runningRuntime(env: EnvRecord): Promise<Runtime> {
 }
 
 // ---------------- commands ----------------
+
+function remoteProvider(): RemoteProvider {
+  const provider = getProvider();
+  if (!(provider instanceof RemoteProvider))
+    throw new RunoError("Set RUNO_SERVER and RUNO_TOKEN to access shared environments");
+  return provider;
+}
+
+async function cmdEnvironments(): Promise<void> {
+  console.log(JSON.stringify(await remoteProvider().environments(), null, 2));
+}
+
+async function cmdAttach(flags: Flags): Promise<void> {
+  const name = flags.positional[0];
+  if (!name) throw new RunoError("Usage: runo attach <env-name>", "List accessible previews with runo environments");
+  const provider = remoteProvider();
+  const shared = (await provider.environments()).find(e => e.envName === name);
+  if (!shared) throw new RunoError("Environment not found or not shared with you");
+  const top = requireRepo();
+  const existing = registry.findByCwd(top);
+  if (existing && existing.name !== name)
+    throw new RunoError("This checkout is already attached to another environment", "Use a separate checkout/worktree for QA");
+  const recipe = process.env.RUNO_RECIPE || shared.recipe;
+  if (!recipe || path.isAbsolute(recipe) || recipe.split(/[\\/]/).includes(".."))
+    throw new RunoError("A repository-relative recipe is required; pass --recipe");
+  if (!existsSync(path.join(top, recipe))) throw new RunoError(`Recipe not found: ${recipe}`);
+  const rt = await provider.status({ id: shared.instanceId, ip: null, state: "unknown" });
+  registry.upsert({
+    name: shared.envName, repo: shared.repo, repoPath: top, worktree: top,
+    branch: shared.branch, slug: shared.slug, externalWorktree: true,
+    provider: "remote", server: process.env.RUNO_SERVER!.replace(/\/+$/, ""),
+    runtime: rt, state: rt.state === "running" ? "running" : "stopped",
+    publicServices: shared.services ?? [], urls: shared.urls, recipe,
+    createdAt: shared.createdAt, updatedAt: new Date().toISOString(),
+  });
+  log.ok(`attached to ${shared.envName} (${shared.repo}@${shared.branch})`);
+  log.info("Use runo logs or runo exec -- <command> to investigate this environment");
+}
+
+async function cmdShare(flags: Flags): Promise<void> {
+  const env = resolveEnv({ branch: flags.branch });
+  await remoteProvider().share((env.runtime as unknown as Runtime).id, flags.positional);
+  log.ok(`collaborators: ${flags.positional.join(", ") || "none"}`);
+}
 
 async function cmdSetup(): Promise<void> {
   const interactive = process.stdin.isTTY === true;
@@ -565,7 +613,7 @@ async function cmdLogs(flags: Flags): Promise<void> {
 
   let cmd: string;
   if (ctx.recipe.mode === "compose") {
-    cmd = `${composePrefix(ctx.recipe, rt.ip)} logs --tail=200 ${follow ? "-f " : ""}${svc ? shq(svc) : ""}`;
+    cmd = `${composePrefix(ctx.recipe, rt.ip, env.urls ?? {}, env.publicServices[0]?.name)} logs --tail=200 ${follow ? "-f " : ""}${svc ? shq(svc) : ""}`;
   } else if (svc) {
     const def = ctx.recipe.services[svc];
     if (!def)
@@ -854,6 +902,9 @@ export async function main(argv: string[]): Promise<void> {
       case "url": return await cmdUrl(flags);
       case "tunnel": return await cmdTunnel(flags);
       case "logs": return await cmdLogs(flags);
+      case "environments": return await cmdEnvironments();
+      case "attach": return await cmdAttach(flags);
+      case "share": return await cmdShare(flags);
       case "exec": return await cmdExec(flags);
       case "ls": return await cmdLs();
       case "suspend": return await cmdSuspend(flags);

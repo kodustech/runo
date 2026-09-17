@@ -19,6 +19,19 @@ import type {
   RuntimeProvider,
 } from "./types";
 
+export interface SharedEnvironment {
+  envName: string;
+  slug: string;
+  owner: string;
+  repo: string;
+  branch: string;
+  instanceId: string;
+  createdAt: string;
+  recipe?: string;
+  urls?: Record<string, string>;
+  services?: { name: string; port: number }[];
+}
+
 export class RemoteProvider implements RuntimeProvider {
   readonly name = "remote";
   private base: string;
@@ -109,8 +122,27 @@ export class RemoteProvider implements RuntimeProvider {
   removeBootImage(): Promise<void> {
     return this.rpc("removeBootImage");
   }
-  async registerServices(rt: Runtime, services: { name: string; port: number }[]): Promise<void> {
-    const res = await this.post("/v1/register-services", { rt, services });
+  async environments(): Promise<SharedEnvironment[]> {
+    const res = await fetch(`${this.base}/v1/envs`, { headers: this.headers() });
+    const data = await res.json() as any;
+    if (!res.ok) throw new RunoError(data.error?.message ?? `server error (${res.status})`);
+    return data.result;
+  }
+
+  async findByTags(repo: string, branch: string): Promise<Runtime | null> {
+    const matches = (await this.environments()).filter(e => e.repo === repo && e.branch === branch);
+    if (matches.length > 1) throw new RunoError("Ambiguous environment; use runo attach <env-name>");
+    return matches.length ? this.status({ id: matches[0].instanceId, ip: null, state: "unknown" }) : null;
+  }
+
+  async share(id: string, members: string[]): Promise<void> {
+    const res = await this.post("/v1/share", { id, members });
+    const data = await res.json() as any;
+    if (!res.ok) throw new RunoError(data.error?.message ?? `server error (${res.status})`);
+  }
+
+  async registerServices(rt: Runtime, services: { name: string; port: number }[], metadata?: { recipe: string; urls: Record<string, string> }): Promise<void> {
+    const res = await this.post("/v1/register-services", { rt, services, ...metadata });
     const data = (await res.json()) as any;
     if (!res.ok || data.error)
       throw new RunoError(data.error?.message ?? `register-services failed (${res.status})`);
@@ -212,7 +244,7 @@ export class RemoteProvider implements RuntimeProvider {
   }
 
   async upload(rt: Runtime, localPath: string, remotePath: string): Promise<void> {
-    const body = await Bun.file(localPath).arrayBuffer();
+    const body = Bun.file(localPath);
     const res = await fetch(
       `${this.base}/v1/upload?rt=${encodeURIComponent(JSON.stringify(rt))}&path=${encodeURIComponent(remotePath)}`,
       { method: "POST", headers: { authorization: `Bearer ${this.token}` }, body },

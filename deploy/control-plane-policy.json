@@ -1,0 +1,13 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Effect":"Allow","Action":["ec2:Describe*"],"Resource":"*","Condition":{"StringEquals":{"aws:RequestedRegion":"sa-east-1"}}},
+    {"Effect":"Allow","Action":"ssm:GetParameter","Resource":"arn:aws:ssm:sa-east-1::parameter/aws/service/canonical/ubuntu/*"},
+    {"Effect":"Allow","Action":["ec2:StartInstances","ec2:StopInstances","ec2:TerminateInstances","ec2:ModifyInstanceAttribute","ec2:CreateTags","ec2:DeleteTags"],"Resource":"arn:aws:ec2:sa-east-1:611816806956:instance/*","Condition":{"StringEquals":{"ec2:ResourceTag/runo:home-hash":"466023"}}},
+    {"Effect":"Allow","Action":"ec2:RunInstances","Resource":["arn:aws:ec2:sa-east-1::image/*","arn:aws:ec2:sa-east-1:611816806956:subnet/subnet-00e3e49810c03a933","arn:aws:ec2:sa-east-1:611816806956:security-group/sg-0d81f2f23db6f3423","arn:aws:ec2:sa-east-1:611816806956:key-pair/key-04c4b4a54697d3468","arn:aws:ec2:sa-east-1:611816806956:network-interface/*"]},
+    {"Effect":"Allow","Action":"ec2:RunInstances","Resource":"arn:aws:ec2:sa-east-1:611816806956:volume/*","Condition":{"NumericLessThanEquals":{"ec2:VolumeSize":"100"}}},
+    {"Effect":"Allow","Action":"ec2:RunInstances","Resource":"arn:aws:ec2:sa-east-1:611816806956:instance/*","Condition":{"StringEquals":{"aws:RequestTag/runo:home-hash":"466023","ec2:InstanceType":"m7i-flex.xlarge"}}},
+    {"Effect":"Allow","Action":"ec2:CreateTags","Resource":["arn:aws:ec2:sa-east-1:611816806956:instance/*","arn:aws:ec2:sa-east-1:611816806956:volume/*"],"Condition":{"StringEquals":{"ec2:CreateAction":"RunInstances"}}},
+    {"Effect":"Allow","Action":"ec2:AuthorizeSecurityGroupIngress","Resource":"arn:aws:ec2:sa-east-1:611816806956:security-group/sg-0d81f2f23db6f3423"}
+  ]
+}

@@ -95,7 +95,7 @@ export interface RuntimeProvider {
   tunnel?(rt: Runtime, ports: number[]): Promise<number>;
 
   /** Tells the control plane which services/ports this env serves (ingress). */
-  registerServices?(rt: Runtime, services: { name: string; port: number }[]): Promise<void>;
+  registerServices?(rt: Runtime, services: { name: string; port: number }[], metadata?: { recipe: string; urls: Record<string, string> }): Promise<void>;
 
   /**
    * Bakes a base boot image with provisioning done (runo bake) —

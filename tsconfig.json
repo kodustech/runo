@@ -8,5 +8,5 @@
     "skipLibCheck": true,
     "types": ["node", "bun-types"]
   },
-  "include": ["src", "bin"]
+  "include": ["src", "bin", "server"]
 }

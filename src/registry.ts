@@ -17,6 +17,7 @@ export interface EnvRecord {
   slug: string;
   worktree: string;
   provider: string; // "aws"
+  server?: string;
   runtime: Record<string, unknown>; // opaque provider data (instanceId, ip, ...)
   state: "creating" | "provisioning" | "running" | "stopped" | "error";
   /** true only after the full pipeline (upload+setup+services+health) — the

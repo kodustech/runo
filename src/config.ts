@@ -10,7 +10,7 @@ export const RUNO_HOME = path.resolve(
 /** Short hash of RUNO_HOME — prevents keypair/SG collisions between parallel installs. */
 export const HASH6 = createHash("sha256").update(RUNO_HOME).digest("hex").slice(0, 6);
 
-export const AWS_REGION = process.env.RUNO_AWS_REGION || "sa-east-1";
+export const AWS_REGION = process.env.RUNO_AWS_REGION || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || "sa-east-1";
 
 export const SSH_DIR = path.join(RUNO_HOME, "ssh");
 export const WORKTREES_DIR = path.join(RUNO_HOME, "worktrees");

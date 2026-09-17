@@ -94,6 +94,8 @@ export function contextFromEnv(env: EnvRecord): EnvContext {
 export function resolveEnv(opts: { branch?: string } = {}): EnvRecord {
   const cwd = process.cwd();
   const byWorktree = registry.findByCwd(cwd);
+  if (byWorktree?.server && byWorktree.server !== process.env.RUNO_SERVER?.replace(/\/+$/, ""))
+    throw new RunoError(`This checkout is attached to ${byWorktree.server}; set RUNO_SERVER accordingly`);
   if (byWorktree && !opts.branch) return byWorktree;
 
   const top = repoTop(cwd);

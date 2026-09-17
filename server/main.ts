@@ -13,7 +13,9 @@
  * v0 scope: single process, token auth, JSON file state. Put TLS in front
  * (ALB/caddy/tailscale) before exposing beyond localhost/VPN.
  */
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import path from "node:path";
 import { RUNO_HOME } from "../src/config";
 import { RunoError } from "../src/errors";
@@ -21,6 +23,7 @@ import { log } from "../src/log";
 import { Ec2Provider } from "../src/provider/aws";
 import type { CreateSpec, ExecOpts, Runtime } from "../src/provider/types";
 import { enforceCreate, loadPolicies } from "./policies";
+import { AccessDenied, canAccess, requireAccess } from "./access";
 
 const PORT = Number(process.env.RUNO_SERVER_PORT || argValue("--port") || 7777);
 const provider = new Ec2Provider();
@@ -56,6 +59,9 @@ interface ServerEnv {
   instanceType: string;
   spot: boolean;
   createdAt: string;
+  members?: string[];
+  recipe?: string;
+  urls?: Record<string, string>;
   /** filled by /v1/register-services once the env's pipeline finishes */
   services?: { name: string; port: number }[];
 }
@@ -90,6 +96,7 @@ function json(data: unknown, status = 200): Response {
 }
 
 function errResponse(e: any): Response {
+  if (e instanceof AccessDenied) return json({ error: { message: e.message } }, 403);
   if (e instanceof RunoError) return json({ error: { message: e.message, hint: e.hint } }, 400);
   return json({ error: { message: e?.message ?? String(e) } }, 500);
 }
@@ -114,11 +121,25 @@ const RPC_ALLOWED = new Set([
 async function handleRpc(user: string, body: any): Promise<Response> {
   const { method, args = [] } = body;
   if (!RPC_ALLOWED.has(method)) return json({ error: { message: `unknown method: ${method}` } }, 400);
+  const envsBefore = Object.values(loadEnvs());
+  if (["waitReady", "status", "suspend", "resume", "destroy"].includes(method)) {
+    const env = requireAccess(user, args[0]?.id, envsBefore, method !== "status");
+    args[0] = await provider.status({ id: env.instanceId, ip: null, state: "unknown" });
+  }
+  if (["poolScale", "prepareBootImage", "removeBootImage", "ensurePorts"].includes(method) &&
+      !(process.env.RUNO_SERVER_ADMINS ?? "").split(",").includes(user))
+    throw new AccessDenied("This operation requires RUNO_SERVER_ADMINS membership");
+  if (method === "listManaged") {
+    const visible = envsBefore.filter(e => canAccess(user, e));
+    return json({ result: await Promise.all(visible.map(e => provider.status({ id: e.instanceId, ip: null, state: "unknown" }))) });
+  }
 
   // org policies: enforced at the boundary devs use, before touching the cloud
   if (method === "create") {
     const pol = loadPolicies();
     const spec = args[0] as CreateSpec;
+    if (envsBefore.some(e => e.envName === spec.envName || (e.repo === spec.repo && e.branch === spec.branch)))
+      throw new RunoError("Environment already exists; attach to it first");
     const userEnvCount = Object.values(loadEnvs()).filter((e) => e.owner === user).length;
     let runningTotal = 0;
     if (pol.max_running_total !== undefined)
@@ -162,7 +183,8 @@ async function handleRpc(user: string, body: any): Promise<Response> {
 // ---------- streaming exec ----------
 
 async function handleExec(user: string, body: any): Promise<Response> {
-  const { rt, command, opts = {} } = body as { rt: Runtime; command: string; opts: ExecOpts };
+  const { command, opts = {} } = body as { command: string; opts: ExecOpts };
+  const rt = await authorizedRuntime(user, body.rt);
   if (!opts.stream) {
     const result = await provider.exec(rt, command, { ...opts, stream: false });
     return json({ result });
@@ -187,26 +209,36 @@ async function handleExec(user: string, body: any): Promise<Response> {
 
 // ---------- upload / download (tar over HTTP) ----------
 
-async function handleUpload(req: Request, url: URL): Promise<Response> {
-  const rt = JSON.parse(url.searchParams.get("rt")!) as Runtime;
+async function authorizedRuntime(user: string, requested: Runtime): Promise<Runtime> {
+  const env = requireAccess(user, requested?.id, Object.values(loadEnvs()));
+  // Resolve the address ourselves: never SSH to a client-supplied host.
+  return provider.status({ id: env.instanceId, ip: null, state: "unknown" });
+}
+
+async function handleUpload(user: string, req: Request, url: URL): Promise<Response> {
+  const rt = await authorizedRuntime(user, JSON.parse(url.searchParams.get("rt")!));
   const remotePath = url.searchParams.get("path")!;
-  const tmp = path.join(RUNO_HOME, "tmp", `upload-${Date.now()}`);
-  mkdirSync(path.dirname(tmp), { recursive: true });
-  await Bun.write(tmp, await req.arrayBuffer());
+  const tmpRoot = path.join(RUNO_HOME, "tmp");
+  mkdirSync(tmpRoot, { recursive: true });
+  const dir = mkdtempSync(path.join(tmpRoot, "upload-"));
+  const tmp = path.join(dir, "payload");
   try {
+    if (!req.body) throw new RunoError("Upload body is required");
+    await pipeline(Readable.fromWeb(req.body as any), createWriteStream(tmp, { mode: 0o600 }));
     await provider.upload(rt, tmp, remotePath);
   } finally {
-    rmSync(tmp, { force: true });
+    rmSync(dir, { recursive: true, force: true });
   }
   return json({ result: null });
 }
 
-async function handleDownload(req: Request): Promise<Response> {
-  const { rt, remotePath, excludes = [] } = (await req.json()) as {
+async function handleDownload(user: string, req: Request): Promise<Response> {
+  const { rt: requested, remotePath, excludes = [] } = (await req.json()) as {
     rt: Runtime;
     remotePath: string;
     excludes: string[];
   };
+  const rt = await authorizedRuntime(user, requested);
   // tar the remote path (dir/ → its contents; otherwise dirname + basename glob)
   const isDir = remotePath.endsWith("/");
   const base = isDir ? remotePath : path.posix.dirname(remotePath);
@@ -297,8 +329,13 @@ interface TtyData {
   proc: ReturnType<typeof Bun.spawn>;
 }
 
-const server = Bun.serve<TtyData, {}>({
+if (process.env.RUNO_EXPECTED_AWS_ARN || process.env.RUNO_EXPECTED_AWS_REGION)
+  await provider.preflight();
+
+const server = Bun.serve<TtyData>({
   port: PORT,
+  hostname: process.env.RUNO_SERVER_HOST ?? "127.0.0.1",
+  maxRequestBodySize: 1024 * 1024 * 1024,
   idleTimeout: 0,
   async fetch(req, srv) {
     const url = new URL(req.url);
@@ -329,26 +366,42 @@ const server = Bun.serve<TtyData, {}>({
         return await handleRpc(user, await req.json());
       if (url.pathname === "/v1/exec" && req.method === "POST")
         return await handleExec(user, await req.json());
-      if (url.pathname === "/v1/upload" && req.method === "POST") return await handleUpload(req, url);
-      if (url.pathname === "/v1/download" && req.method === "POST") return await handleDownload(req);
+      if (url.pathname === "/v1/upload" && req.method === "POST") return await handleUpload(user, req, url);
+      if (url.pathname === "/v1/download" && req.method === "POST") return await handleDownload(user, req);
+      if (url.pathname === "/v1/share" && req.method === "POST") {
+        const { id, members } = await req.json() as { id: string; members: string[] };
+        const envs = loadEnvs();
+        const env = requireAccess(user, id, Object.values(envs), true);
+        const known = new Set(tokens.values());
+        if (!Array.isArray(members) || members.some(m => typeof m !== "string" || !known.has(m)))
+          throw new RunoError("members must contain registered user names");
+        env.members = [...new Set(members)];
+        saveEnvs(envs);
+        return json({ result: null });
+      }
       if (url.pathname === "/v1/policies" && req.method === "GET")
         return json({ result: loadPolicies() });
       if (url.pathname === "/v1/register-services" && req.method === "POST") {
-        const { rt, services } = (await req.json()) as {
+        const { rt, services, recipe, urls } = (await req.json()) as {
           rt: Runtime;
           services: { name: string; port: number }[];
+          recipe?: string;
+          urls?: Record<string, string>;
         };
         const envs = loadEnvs();
+        requireAccess(user, rt?.id, Object.values(envs), true);
         for (const e of Object.values(envs))
           if (e.instanceId === rt.id) {
             e.services = services;
+            e.recipe = recipe;
+            e.urls = urls;
             saveEnvs(envs);
             return json({ result: null });
           }
         return json({ error: { message: `no registered env for instance ${rt.id}` } }, 404);
       }
       if (url.pathname === "/v1/envs" && req.method === "GET") {
-        const envs = Object.values(loadEnvs());
+        const envs = Object.values(loadEnvs()).filter(e => canAccess(user, e));
         if (url.searchParams.get("live") !== "1") return json({ result: envs });
         // enrich with live instance state for the panel
         const live = await Promise.all(
@@ -364,7 +417,7 @@ const server = Bun.serve<TtyData, {}>({
         return json({ result: live });
       }
       if (url.pathname === "/v1/tty") {
-        const rt = JSON.parse(url.searchParams.get("rt")!) as Runtime;
+        const rt = await authorizedRuntime(user, JSON.parse(url.searchParams.get("rt")!));
         const command = Buffer.from(url.searchParams.get("cmd")!, "base64").toString();
         const proc = provider.spawnTty(rt, command);
         const ok = srv.upgrade(req, { data: { proc } });
