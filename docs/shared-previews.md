@@ -76,7 +76,7 @@ export RUNO_TOKEN='<qa-token>'
 runo environments
 runo attach <env-name>
 runo logs kodus-api
-runo logs kodus-worker
+runo logs worker
 runo exec -- docker ps
 ```
 

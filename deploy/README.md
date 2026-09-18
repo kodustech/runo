@@ -3,10 +3,26 @@
 Only `arn:aws:iam::611816806956:user/kodus-devops-agent` in `us-east-2`
 is authorized for this migration. Never use the default AWS profile.
 
-Status: local preparation only. No EC2 has been provisioned and CI has not been
-changed. Configure the named profile and run
-`bash deploy/check-isolated-access.sh`. The script refuses other identities
-and never falls back to environment credentials or the default profile.
+Server deployed: `i-0361a0dacfffae9b9`, t3.micro, encrypted 12 GiB gp3,
+Elastic IP `3.14.180.98` (`eipalloc-0f5f6524591ee0ae2`).
+HTTPS endpoint: https://3-14-180-98.sslip.io . The process runs as ubuntu under
+systemd, using about 37 MiB idle at the initial check. SSH is restricted to the
+operator's IP in `sg-06c6ce2083d7594d8`; there is no instance profile.
+
+The Preview environment in GitHub has PREVIEW_RUNO_SERVER and a dedicated
+PREVIEW_RUNO_TOKEN. Integration is staged on kodus-ai branch
+`infra/runo-ohio-control-plane`; manual validation targets PR #1936.
+Validation run: https://github.com/kodustech/kodus-ai/actions/runs/35289191624
+completed successfully. The new PR #1936 preview is
+https://3-138-125-33.sslip.io (instance i-0a9b399e9671405d8).
+All seven containers were healthy; HTTP returned 200. QA attach/exec/logs,
+PostgreSQL transactional write/read with rollback, and MongoDB authenticated
+ping passed. Default-branch cutover is the next deployment step.
+
+Run `bash deploy/check-isolated-access.sh` before cloud administration. It
+refuses other identities and never falls back to environment credentials or
+the default profile. Operator key and local QA configuration live in ignored
+`.runo-deploy/` with restricted permissions. Do not commit or print them.
 
 ## New server and environments
 
