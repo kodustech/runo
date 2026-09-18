@@ -118,6 +118,29 @@ export async function uploadCode(
   if (extract.exitCode !== 0)
     throw new RunoError(`Code extraction on the VM failed: ${extract.stderr.trim()}`);
 
+  await uploadRecipeFiles(provider, rt, ctx, remoteDir);
+
+  // git on the VM so the agent can work there
+  const localSha = git(ctx.worktree, "rev-parse", "--short", "HEAD").stdout || "unknown";
+  const init = await provider.exec(
+    rt,
+    `git init -q -b ${shq(ctx.branch)} && git add -A && git -c user.name=runo -c user.email=runo@kodus.local commit -qm ${shq(`runo: upload ${localSha}`)}`,
+    { cwd: remoteDir },
+  );
+  if (init.exitCode !== 0)
+    throw new RunoError(`git init/commit on the VM failed: ${init.stderr.trim()}`);
+}
+
+/** Uploads untracked runtime material (env files, preview credentials) before
+ * a reconcile. A running VM can be adopted by a fresh CI runner, so relying on
+ * the original `up` materialization would otherwise leave it with stale or
+ * missing files when the recipe adds a new files.copy entry. */
+export async function uploadRecipeFiles(
+  provider: RuntimeProvider,
+  rt: Runtime,
+  ctx: EnvContext,
+  remoteDir: string,
+): Promise<void> {
   // files.copy: required untracked files (e.g. .env) — from the worktree, else the original repo
   for (const rel of ctx.recipe.filesCopy) {
     const fromWorktree = path.join(ctx.worktree, rel);
@@ -131,16 +154,6 @@ export async function uploadCode(
     log.step(`copying untracked file: ${rel}`);
     await provider.upload(rt, src, path.posix.join(remoteDir, rel));
   }
-
-  // git on the VM so the agent can work there
-  const localSha = git(ctx.worktree, "rev-parse", "--short", "HEAD").stdout || "unknown";
-  const init = await provider.exec(
-    rt,
-    `git init -q -b ${shq(ctx.branch)} && git add -A && git -c user.name=runo -c user.email=runo@kodus.local commit -qm ${shq(`runo: upload ${localSha}`)}`,
-    { cwd: remoteDir },
-  );
-  if (init.exitCode !== 0)
-    throw new RunoError(`git init/commit on the VM failed: ${init.stderr.trim()}`);
 }
 
 export async function runSteps(
@@ -344,6 +357,9 @@ export async function upEnv(ctx: EnvContext): Promise<EnvRecord> {
 
   // ---- reconcile a running env ----
   log.step("environment already exists — reconciling services and health check…");
+  // CI runners are ephemeral and may have added/rotated files.copy material
+  // since this VM was created. Upload it before compose parses env_file paths.
+  await uploadRecipeFiles(provider, rt, ctx, remoteDir);
   return await finishUp(provider, rt, ctx, env, { runData: adopted });
 }
 
