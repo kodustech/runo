@@ -26,6 +26,7 @@ import { composePrefix } from "./engine/services";
 import { resumeEnv, upEnv } from "./engine/up";
 import { validateEnv } from "./engine/validate";
 import { ensureWorktree, removeWorktree } from "./engine/worktree";
+import { PUSH_EXCLUDES, pruneRemote } from "./engine/prune";
 import { slugify } from "./config";
 
 const USAGE = `runo — one remote environment per branch (AWS EC2)
@@ -545,12 +546,14 @@ async function cmdPush(flags: Flags): Promise<void> {
   const rt = await runningRuntime(env);
   const provider = getProvider(env.provider);
   log.step(`rsync worktree → VM (${remoteRepoDir(env.repo)})`);
-  await provider.uploadDir(rt, `${env.worktree}/`, `${remoteRepoDir(env.repo)}/`, [
-    ".git",
-    "node_modules",
-    "dist",
-    ".kodus",
-  ]);
+  await provider.uploadDir(
+    rt,
+    `${env.worktree}/`,
+    `${remoteRepoDir(env.repo)}/`,
+    PUSH_EXCLUDES,
+  );
+  const pruned = await pruneRemote(provider, rt, env.worktree, remoteRepoDir(env.repo));
+  if (pruned > 0) log.info(`removed ${pruned} file(s) on the VM that no longer exist here`);
   if (flags.restart) {
     const ctx = contextFromEnv(env);
     log.step("restarting services…");
