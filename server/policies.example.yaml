@@ -20,3 +20,7 @@ max_running_total: 9
 # Auto-destroy environments older than this many days (fractions allowed).
 # The sweeper runs at startup and every 10 minutes.
 env_ttl_days: 7
+
+# Ports any user may open to the world (default: 80 and 443, what expose
+# mode https needs). Other ports take an admin. [] = admins only.
+# allowed_public_ports: [80, 443]
