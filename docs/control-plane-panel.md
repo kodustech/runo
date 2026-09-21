@@ -46,6 +46,11 @@ an admin promotes in the panel.
 | policies, prices, users | admins | admins |
 | mint a CLI token, change roles | — | only within 15 min of logging in |
 
+Opening ports on the fleet's shared security group is open to everyone for the
+ports in the `allowed_public_ports` policy (default 80 and 443 — what
+`expose.mode: https` needs, so CI does not have to be an admin); any other port
+takes an admin.
+
 Admins can suspend/resume/destroy **any** machine (that is the cost lever) but
 get no exec/upload/download on machines they do not own or share.
 

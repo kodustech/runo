@@ -24,7 +24,15 @@ export interface Policies {
   max_running_total?: number;
   /** Auto-destroy environments older than this many days (fractions allowed). */
   env_ttl_days?: number;
+  /**
+   * Ports any user may open to the world on the shared security group. Absent =
+   * 80 and 443, what `expose.mode: https` needs — so CI does not have to be an
+   * admin to publish a preview. Anything else takes an admin.
+   */
+  allowed_public_ports?: number[];
 }
+
+export const DEFAULT_PUBLIC_PORTS = [80, 443];
 
 const POLICIES_PATH = () => path.join(RUNO_HOME, "policies.yaml");
 
@@ -41,7 +49,7 @@ export function loadPolicies(): Policies {
 /** Validates a policy document coming from the panel; absent/null fields mean unlimited. */
 export function parsePolicies(input: any): Policies {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new RunoError("policies must be an object");
-  const known = ["allowed_instance_types", "max_disk_gb", "max_envs_per_user", "max_running_total", "env_ttl_days"];
+  const known = ["allowed_instance_types", "max_disk_gb", "max_envs_per_user", "max_running_total", "env_ttl_days", "allowed_public_ports"];
   const unknown = Object.keys(input).filter((k) => !known.includes(k));
   if (unknown.length) throw new RunoError(`Unknown policy: ${unknown.join(", ")}`);
   const out: Policies = {};
@@ -56,6 +64,12 @@ export function parsePolicies(input: any): Policies {
     if (v === undefined || v === null) continue;
     if (!Number.isInteger(v) || v < 1) throw new RunoError(`${field} must be a positive integer`);
     out[field] = v;
+  }
+  const ports = input.allowed_public_ports;
+  if (ports !== undefined && ports !== null) {
+    if (!Array.isArray(ports) || ports.some((p) => !Number.isInteger(p) || p < 1 || p > 65535))
+      throw new RunoError("allowed_public_ports must be a list of ports (1-65535); an empty list means admins only");
+    out.allowed_public_ports = [...new Set(ports as number[])];
   }
   const ttl = input.env_ttl_days;
   if (ttl !== undefined && ttl !== null) {

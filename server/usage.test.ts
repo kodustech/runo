@@ -75,7 +75,8 @@ test("a resume requested through the server is not reported as automatic", async
 test("panel input is validated before it reaches policies.yaml or the price table", () => {
   expect(parsePolicies({ max_disk_gb: 100, env_ttl_days: 0.5, max_envs_per_user: null })).toEqual({ max_disk_gb: 100, env_ttl_days: 0.5 });
   expect(parsePolicies({ allowed_instance_types: ["t3.large", "t3.large"] })).toEqual({ allowed_instance_types: ["t3.large"] });
-  for (const bad of [{ max_disk_gb: -1 }, { max_running_total: 1.5 }, { allowed_instance_types: ["rm -rf"] }, { surprise: 1 }, []])
+  expect(parsePolicies({ allowed_public_ports: [443, 443, 8080] })).toEqual({ allowed_public_ports: [443, 8080] });
+  for (const bad of [{ allowed_public_ports: [0] }, { allowed_public_ports: "80" }, { max_disk_gb: -1 }, { max_running_total: 1.5 }, { allowed_instance_types: ["rm -rf"] }, { surprise: 1 }, []])
     expect(() => parsePolicies(bad)).toThrow();
   expect(parsePricing(defaultPricing("us-east-2")).instance_hourly["t3.xlarge"]).toBe(0.1664);
   expect(() => parsePricing({ ...defaultPricing("us-east-2"), spot_factor: 2 })).toThrow();

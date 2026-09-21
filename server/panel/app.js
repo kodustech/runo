@@ -35,6 +35,8 @@ async function run(label, fn) {
   } catch (err) {
     if (err.code === "reauth") {
       if (confirm(err.message + "\n\nYou will come back to the panel right after.")) {
+        // the login round-trip lands on "/": remember where the user was
+        try { sessionStorage.setItem("runo-return", state.tab); } catch {}
         if (state.github) location.href = "/auth/github";
         else await logout();
       }
@@ -247,6 +249,7 @@ const views = {
       if (e.action === "user.create") return `${d.login} (service account)`;
       if (e.action === "policies.update") return JSON.stringify(d.after);
       if (e.action === "pool.scale") return `target ${d.target}`;
+      if (e.action === "ports.open") return (d.ports ?? []).join(", ");
       return "";
     };
     const rows = events.map((e) => `<tr><td>${esc(when(e.ts))}</td><td>${esc(e.actor)}</td><td>${esc(e.action)}</td><td>${esc(e.envName ?? "")}</td><td class="dim">${esc(detail(e))}</td></tr>`);
@@ -277,7 +280,7 @@ const views = {
         ${services.length ? `<select name="user"><option value="">for me</option>${services.map((u) => `<option value="${esc(u.login)}">for ${esc(u.login)}</option>`).join("")}</select>` : ""}
         <button type="submit">create token</button></form>${secret}
       <div class="card tablebox"><table><thead><tr><th>name</th><th>identity</th><th>token</th><th>created</th><th>last used</th><th></th></tr></thead>
-      <tbody>${tokenRows.join("") || `<tr><td colspan="6" class="empty">no tokens — create one to use the runo CLI against this server</td></tr>`}</tbody></table></div></div>`;
+      <tbody>${tokenRows.join("") || `<tr><td colspan="6" class="empty">no tokens yet — name one above and press "create token" to use the runo CLI against this server</td></tr>`}</tbody></table></div></div>`;
     if (!admin) return tokenSection;
 
     const val = (v) => esc(v ?? "");
@@ -287,6 +290,7 @@ const views = {
         <label>Max disk per environment, GB<input name="max_disk_gb" type="number" min="1" value="${val(policies.max_disk_gb)}" /></label>
         <label>Max environments per person<input name="max_envs_per_user" type="number" min="1" value="${val(policies.max_envs_per_user)}" /></label>
         <label>Max machines running at once, whole org<input name="max_running_total" type="number" min="1" value="${val(policies.max_running_total)}" /></label>
+        <label>Ports anyone may open to the world (comma separated; empty = 80, 443; other ports need an admin)<input name="allowed_public_ports" value="${val(policies.allowed_public_ports?.join(", "))}" /></label>
         <label>Destroy environments older than, days (fractions allowed)<input name="env_ttl_days" type="number" min="0" step="any" value="${val(policies.env_ttl_days)}" /></label>
         <div class="row"><button type="submit" class="primary">save policies</button><span class="dim small">Empty = unlimited. Applies to the next create; the TTL sweeper runs every 10 minutes.</span></div>
       </form></div>`;
@@ -366,6 +370,7 @@ const forms = {
     allowed_instance_types: String(f.get("allowed_instance_types")).split(",").map((s) => s.trim()).filter(Boolean),
     max_disk_gb: numberOrNull(f.get("max_disk_gb")), max_envs_per_user: numberOrNull(f.get("max_envs_per_user")),
     max_running_total: numberOrNull(f.get("max_running_total")), env_ttl_days: numberOrNull(f.get("env_ttl_days")),
+    allowed_public_ports: String(f.get("allowed_public_ports")).trim() ? String(f.get("allowed_public_ports")).split(",").map((s) => Number(s.trim())) : null,
   } }),
   pricing: (f) => api("/v1/pricing", { method: "PUT", body: {
     instance_hourly: Object.fromEntries(String(f.get("instance_hourly")).split("\n").map((l) => l.trim().split(/[\s:=]+/)).filter((p) => p[0]).map(([t, v]) => [t, Number(v)])),
@@ -459,8 +464,12 @@ async function start() {
   $("whoRole").hidden = !state.me.admin;
   $("avatar").hidden = !state.me.avatar;
   if (state.me.avatar) $("avatar").src = state.me.avatar;
-  if (views[location.hash.slice(1)]) state.tab = location.hash.slice(1);
+  let back = null;
+  try { back = sessionStorage.getItem("runo-return"); sessionStorage.removeItem("runo-return"); } catch {}
+  if (views[back]) state.tab = back;
+  else if (views[location.hash.slice(1)]) state.tab = location.hash.slice(1);
   await render();
+  if (views[back]) msg("You are verified — do it again and it will go through.");
 }
 
 start();

@@ -22,6 +22,7 @@ async function withServer(run: (request: Call, port: string) => Promise<void>): 
         async suspend(rt) { return { ...rt, state: "stopped" }; }
         async destroy() {}
         async poolStatus() { return []; }
+        async ensurePorts() {}
       }
     }));
     await import(${JSON.stringify(new URL("./main.ts", import.meta.url).pathname)});
@@ -98,6 +99,10 @@ test("a browser session runs the panel but cannot reach a VM, skip CSRF, or act 
   expect((await session("/v1/rpc", "POST", { method: "suspend", args: [rt] }, {})).status).toBe(403);
   expect((await session("/v1/rpc", "POST", { method: "suspend", args: [rt] }, { "x-runo-panel": "1", origin: "https://evil.example" })).status).toBe(403);
   expect((await session("/v1/rpc", "POST", { method: "suspend", args: [rt] })).status).toBe(200);
+  // publishing a preview must not take an admin: 80/443 are open to everyone, the rest is not
+  expect((await request("/v1/rpc", "stranger", { method: "ensurePorts", args: [[80, 443]] })).status).toBe(200);
+  expect((await request("/v1/rpc", "stranger", { method: "ensurePorts", args: [[5432]] })).status).toBe(403);
+  expect((await request("/v1/rpc", "boss", { method: "ensurePorts", args: [[5432]] })).status).toBe(200);
   // configuration is admin-only
   expect((await session("/v1/policies", "PUT", { max_disk_gb: 1 })).status).toBe(403);
   expect((await session("/v1/users")).status).toBe(403);

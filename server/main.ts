@@ -24,7 +24,7 @@ import { RunoError } from "../src/errors";
 import { log } from "../src/log";
 import { Ec2Provider } from "../src/provider/aws";
 import type { CreateSpec, ExecOpts, Runtime } from "../src/provider/types";
-import { enforceCreate, loadPolicies } from "./policies";
+import { DEFAULT_PUBLIC_PORTS, enforceCreate, loadPolicies } from "./policies";
 import { AccessDenied, canAccess, requireAccess } from "./access";
 import { Auth, authConfigFromEnv, ReauthRequired, readCookie, safeEqual, sessionMayCall, SESSION_RPC, Throttle, type Identity } from "./auth";
 import { handlePanelApi } from "./panelApi";
@@ -139,8 +139,15 @@ async function handleRpc(who: Identity, body: any): Promise<Response> {
     target = requireAccess(user, args[0]?.id, envsBefore, method !== "status", who.admin && method !== "waitReady");
     args[0] = await provider.status({ id: target.instanceId, ip: null, state: "unknown" });
   }
-  if (["poolScale", "prepareBootImage", "removeBootImage", "ensurePorts"].includes(method) && !who.admin)
+  if (["poolScale", "prepareBootImage", "removeBootImage"].includes(method) && !who.admin)
     throw new AccessDenied("This operation requires an admin");
+  // the security group is shared by the whole fleet: users open only what policy lists
+  if (method === "ensurePorts" && !who.admin) {
+    const allowed = loadPolicies().allowed_public_ports ?? DEFAULT_PUBLIC_PORTS;
+    const ports = args[0];
+    if (!Array.isArray(ports) || ports.some((p) => !allowed.includes(p)))
+      throw new AccessDenied(`Opening ports other than ${allowed.join(", ") || "(none)"} requires an admin`);
+  }
   if (method === "listManaged") {
     const visible = envsBefore.filter(e => canAccess(user, e));
     return json({ result: await Promise.all(visible.map(e => provider.status({ id: e.instanceId, ip: null, state: "unknown" }))) });
@@ -170,6 +177,7 @@ async function handleRpc(who: Identity, body: any): Promise<Response> {
     void sampleNow();
   }
   if (method === "poolScale") store.addEvent({ actor: user, action: "pool.scale", detail: { target: args[0] } });
+  if (method === "ensurePorts") store.addEvent({ actor: user, action: "ports.open", detail: { ports: args[0] } });
   if (method === "create") {
     const spec = args[0];
     const rt = result as Runtime;
