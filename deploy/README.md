@@ -6,8 +6,8 @@ is authorized for this migration. Never use the default AWS profile.
 Server deployed: `i-0361a0dacfffae9b9`, t3.micro, encrypted 12 GiB gp3,
 Elastic IP `3.14.180.98` (`eipalloc-0f5f6524591ee0ae2`).
 HTTPS endpoint: https://runo.kodus.io (Cloudflare A record, DNS only, → the
-Elastic IP; Caddy issues the certificate). https://3-14-180-98.sslip.io still
-answers until CI and QA move off it. The process runs as ubuntu under
+Elastic IP; Caddy issues the certificate). The old sslip.io name was retired
+once CI and QA moved. The process runs as ubuntu under
 systemd, using about 37 MiB idle at the initial check. SSH is restricted to the
 operator's IP in `sg-06c6ce2083d7594d8`; there is no instance profile.
 

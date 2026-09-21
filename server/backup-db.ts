@@ -12,6 +12,9 @@ import { mkdirSync, readdirSync, rmSync } from "node:fs";
 import path from "node:path";
 import { RUNO_HOME } from "../src/config";
 
+// cron and ssh do not inherit the service's UMask=0077; the copy holds token hashes
+process.umask(0o077);
+
 const keep = Number(process.argv[2]) || 14;
 const dir = path.join(RUNO_HOME, "backups");
 mkdirSync(dir, { recursive: true, mode: 0o700 });
