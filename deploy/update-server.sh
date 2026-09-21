@@ -40,7 +40,15 @@ systemctl is-active --quiet runo-server || rollback
 # /auth/config only exists in the new build
 [[ $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:7777/auth/config) == 200 ]] || rollback
 ls -la /var/lib/runo-ohio/server.db
+# daily consistent copy of the history database (idempotent)
+printf 'RUNO_HOME=/var/lib/runo-ohio\n17 3 * * * ubuntu cd /opt/runo && /home/ubuntu/.bun/bin/bun server/backup-db.ts >/dev/null\n' |
+  sudo tee /etc/cron.d/runo-backup >/dev/null
 echo "deployed"
 REMOTE
+
+# every deploy also takes one copy off the machine
+mkdir -p .runo-deploy/backups
+snapshot=$("${SSH[@]}" "$HOST" 'cd /opt/runo && RUNO_HOME=/var/lib/runo-ohio /home/ubuntu/.bun/bin/bun server/backup-db.ts')
+scp -q "${SSH[@]:1}" "$HOST:$snapshot" .runo-deploy/backups/ && echo "history backup: .runo-deploy/backups/$(basename "$snapshot")"
 
 curl -fsS "$PUBLIC_URL/auth/config" && echo

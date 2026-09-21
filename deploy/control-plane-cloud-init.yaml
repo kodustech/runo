@@ -21,6 +21,11 @@ write_files:
       LimitNOFILE=8192
       [Install]
       WantedBy=multi-user.target
+  - path: /etc/cron.d/runo-backup
+    permissions: '0644'
+    content: |
+      RUNO_HOME=/var/lib/runo-ohio
+      17 3 * * * ubuntu cd /opt/runo && /home/ubuntu/.bun/bin/bun server/backup-db.ts >/dev/null
 runcmd:
   - [bash, -lc, 'curl -fsSL https://bun.sh/install | sudo -u ubuntu bash']
   - [mkdir, -p, /opt/runo, /var/lib/runo-ohio/ssh]
