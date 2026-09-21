@@ -1,3 +1,5 @@
 node_modules/
 .env
 .runo-deploy/
+.playwright-mcp/
+.pnpm-store/
