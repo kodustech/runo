@@ -33,8 +33,12 @@ kodustech org, callback `/auth/github/callback`); only active kodustech members
 get in. `RUNO_GITHUB_*`, `RUNO_PUBLIC_URL` and `RUNO_SERVER_ADMINS` live in
 /etc/runo-server.env. `preview-ci` and `qa` remain token identities in
 `RUNO_SERVER_TOKENS`; humans mint personal CLI tokens in the panel. History,
-users, sessions and hashed tokens are in /var/lib/runo-ohio/server.db — back it
-up with the rest of RUNO_HOME. How the panel works:
+users, sessions and hashed tokens are in /var/lib/runo-ohio/server.db. A cron
+job (`/etc/cron.d/runo-backup`, 03:17 UTC) keeps 14 consistent daily copies in
+/var/lib/runo-ohio/backups, and every `update-server.sh` run pulls one into
+`.runo-deploy/backups/`. Both are on-host or manual: losing the volume between
+deploys loses up to that much history. An automatic off-host copy needs an S3
+bucket (or EBS snapshots) the isolated identity is allowed to write — not set up. How the panel works:
 [docs/control-plane-panel.md](../docs/control-plane-panel.md).
 
 Code-only updates: `bash deploy/update-server.sh` from the repo root. It runs
