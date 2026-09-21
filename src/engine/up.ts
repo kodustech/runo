@@ -10,6 +10,7 @@ import { shq } from "../ssh";
 import { git, type EnvContext } from "./context";
 import { getExpose } from "../expose";
 import { composePrefix, healthcheckPublic, planServices, probeServices, startServices, waitInternalPorts } from "./services";
+import { ensureIdleWatchdog } from "./idleWatchdog";
 
 /** Tooling that cloud-init must have left ready on the VM. */
 const TOOLING_CHECK =
@@ -217,6 +218,9 @@ async function finishUp(
   await provider.exec(rt, `sudo mkdir -p /etc/runo && echo ${idle} | sudo tee /etc/runo/idle-limit >/dev/null`);
   if (idle > 0)
     log.dim(`auto-suspend: the VM suspends itself after ${Math.round(idle / 60)}min of inactivity (limits.idle_suspend)`);
+  // the watchdog itself (script + cron) must exist too — baked/pool/old VMs
+  // can miss the cloud-init install and would then stay up forever
+  await ensureIdleWatchdog(provider, rt);
 
   // control plane learns the env's services (per-env hostnames on the ingress)
   await provider.registerServices?.(

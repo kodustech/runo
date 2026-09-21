@@ -10,42 +10,49 @@
  *   RUNO_SERVER_TOKENS="alice:tok1,bob:tok2" \
  *   bun server/main.ts [--port 7777]
  *
- * v0 scope: single process, token auth, JSON file state. Put TLS in front
+ * Single process. server-envs.json is the live registry; server.db (SQLite)
+ * is history, users, sessions and tokens. People log into the panel with
+ * GitHub OAuth (see docs/control-plane-panel.md). Put TLS in front
  * (ALB/caddy/tailscale) before exposing beyond localhost/VPN.
  */
 import { createWriteStream, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import path from "node:path";
-import { RUNO_HOME } from "../src/config";
+import { AWS_REGION, RUNO_HOME } from "../src/config";
 import { RunoError } from "../src/errors";
 import { log } from "../src/log";
 import { Ec2Provider } from "../src/provider/aws";
 import type { CreateSpec, ExecOpts, Runtime } from "../src/provider/types";
 import { enforceCreate, loadPolicies } from "./policies";
 import { AccessDenied, canAccess, requireAccess } from "./access";
+import { Auth, authConfigFromEnv, ReauthRequired, readCookie, safeEqual, sessionMayCall, SESSION_RPC, Throttle, type Identity } from "./auth";
+import { handlePanelApi } from "./panelApi";
+import { Store } from "./store";
+import { sampleFleet } from "./usage";
+import { randomBytes } from "node:crypto";
 
 const PORT = Number(process.env.RUNO_SERVER_PORT || argValue("--port") || 7777);
 const provider = new Ec2Provider();
 
 // ---------- auth ----------
 
-const tokens = new Map<string, string>(); // token -> user
-for (const pair of (process.env.RUNO_SERVER_TOKENS ?? "").split(",")) {
-  const [user, token] = pair.split(":").map((s) => s?.trim());
-  if (user && token) tokens.set(token, user);
-}
-if (tokens.size === 0) {
-  console.error("RUNO_SERVER_TOKENS is required (format: \"alice:token1,bob:token2\")");
+mkdirSync(RUNO_HOME, { recursive: true });
+const store = new Store(path.join(RUNO_HOME, "server.db"));
+let auth: Auth;
+try {
+  auth = new Auth(authConfigFromEnv(process.env), store);
+} catch (e: any) {
+  console.error(e.message + (e.hint ? `\n  ${e.hint}` : ""));
   process.exit(1);
 }
-
-function authUser(req: Request, url: URL): string | null {
-  const header = req.headers.get("authorization") ?? "";
-  const bearer = header.startsWith("Bearer ") ? header.slice(7) : null;
-  const token = bearer ?? url.searchParams.get("token");
-  return token ? tokens.get(token) ?? null : null;
+if (auth.config.envTokens.size === 0 && !auth.config.github && store.liveTokenCount() === 0) {
+  console.error(
+    "Nobody could log in: set RUNO_SERVER_TOKENS (format: \"alice:token1,bob:token2\") and/or GitHub login (RUNO_GITHUB_CLIENT_ID, RUNO_GITHUB_CLIENT_SECRET, RUNO_GITHUB_ALLOWED_ORGS, RUNO_PUBLIC_URL)",
+  );
+  process.exit(1);
 }
+const loginThrottle = new Throttle();
 
 // ---------- server-side env registry (the platform team's view) ----------
 
@@ -96,6 +103,7 @@ function json(data: unknown, status = 200): Response {
 }
 
 function errResponse(e: any): Response {
+  if (e instanceof ReauthRequired) return json({ error: { message: e.message, code: "reauth" } }, 401);
   if (e instanceof AccessDenied) return json({ error: { message: e.message } }, 403);
   if (e instanceof RunoError) return json({ error: { message: e.message, hint: e.hint } }, 400);
   return json({ error: { message: e?.message ?? String(e) } }, 500);
@@ -118,17 +126,21 @@ const RPC_ALLOWED = new Set([
   "removeBootImage",
 ]);
 
-async function handleRpc(user: string, body: any): Promise<Response> {
+async function handleRpc(who: Identity, body: any): Promise<Response> {
+  const user = who.user;
   const { method, args = [] } = body;
   if (!RPC_ALLOWED.has(method)) return json({ error: { message: `unknown method: ${method}` } }, 400);
+  if (who.via === "session" && !SESSION_RPC.has(method))
+    throw new AccessDenied("This operation needs a CLI token, not a browser session");
   const envsBefore = Object.values(loadEnvs());
+  let target: ServerEnv | undefined;
   if (["waitReady", "status", "suspend", "resume", "destroy"].includes(method)) {
-    const env = requireAccess(user, args[0]?.id, envsBefore, method !== "status");
-    args[0] = await provider.status({ id: env.instanceId, ip: null, state: "unknown" });
+    // admins manage any machine's lifecycle (cost control) but waitReady execs on the VM
+    target = requireAccess(user, args[0]?.id, envsBefore, method !== "status", who.admin && method !== "waitReady");
+    args[0] = await provider.status({ id: target.instanceId, ip: null, state: "unknown" });
   }
-  if (["poolScale", "prepareBootImage", "removeBootImage", "ensurePorts"].includes(method) &&
-      !(process.env.RUNO_SERVER_ADMINS ?? "").split(",").includes(user))
-    throw new AccessDenied("This operation requires RUNO_SERVER_ADMINS membership");
+  if (["poolScale", "prepareBootImage", "removeBootImage", "ensurePorts"].includes(method) && !who.admin)
+    throw new AccessDenied("This operation requires an admin");
   if (method === "listManaged") {
     const visible = envsBefore.filter(e => canAccess(user, e));
     return json({ result: await Promise.all(visible.map(e => provider.status({ id: e.instanceId, ip: null, state: "unknown" }))) });
@@ -149,12 +161,27 @@ async function handleRpc(user: string, body: any): Promise<Response> {
     enforceCreate(pol, spec, { user, userEnvCount, runningTotal });
   }
 
+  const startedAt = Date.now();
   const result = await (provider as any)[method](...args);
 
   // bookkeeping for the platform view
+  if (method === "suspend" || method === "resume") {
+    store.addEvent({ actor: user, action: method, envName: target!.envName, instanceId: target!.instanceId });
+    void sampleNow();
+  }
+  if (method === "poolScale") store.addEvent({ actor: user, action: "pool.scale", detail: { target: args[0] } });
   if (method === "create") {
     const spec = args[0];
     const rt = result as Runtime;
+    store.addMachine({
+      instanceId: rt.id, envName: spec.envName, slug: spec.slug, owner: user, repo: spec.repo, branch: spec.branch,
+      instanceType: rt.instanceType ?? spec.instanceType, spot: Boolean(spec.spot), diskGb: spec.diskGb, createdAt: startedAt,
+    });
+    store.openRun(rt.id, startedAt);
+    store.addEvent({
+      actor: user, action: "create", envName: spec.envName, instanceId: rt.id,
+      detail: { repo: spec.repo, branch: spec.branch, instanceType: rt.instanceType ?? spec.instanceType, diskGb: spec.diskGb, spot: Boolean(spec.spot) },
+    });
     const envs = loadEnvs();
     envs[spec.envName] = {
       envName: spec.envName,
@@ -175,6 +202,8 @@ async function handleRpc(user: string, body: any): Promise<Response> {
     const envs = loadEnvs();
     for (const [name, e] of Object.entries(envs)) if (e.instanceId === rt.id) delete envs[name];
     saveEnvs(envs);
+    store.endMachine(rt.id, user, "destroy");
+    store.addEvent({ actor: user, action: "destroy", envName: target!.envName, instanceId: rt.id });
     log.step(`[${user}] destroyed ${rt.name ?? rt.id}`);
   }
   return json({ result: result ?? null });
@@ -323,6 +352,117 @@ async function handleIngress(req: Request, hostname: string): Promise<Response> 
   }
 }
 
+// ---------- web panel + login ----------
+
+const PANEL_FILES: Record<string, { file: string; type: string }> = {
+  "/": { file: "index.html", type: "text/html; charset=utf-8" },
+  "/index.html": { file: "index.html", type: "text/html; charset=utf-8" },
+  "/app.js": { file: "app.js", type: "text/javascript; charset=utf-8" },
+  "/app.css": { file: "app.css", type: "text/css; charset=utf-8" },
+};
+// no inline script, no third-party origin: an XSS in the panel has nowhere to load code from
+const PANEL_HEADERS = {
+  "content-security-policy":
+    "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' https://avatars.githubusercontent.com; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+  "x-content-type-options": "nosniff",
+  "referrer-policy": "no-referrer",
+  "x-frame-options": "DENY",
+};
+const TOO_MANY = { error: { message: "too many failed logins — wait a few minutes" } };
+
+/** Behind the local reverse proxy (Caddy) the peer is loopback; the proxy appends the real client last. */
+function clientAddress(req: Request, srv: { requestIP(req: Request): { address: string } | null }): string {
+  const peer = srv.requestIP(req)?.address ?? "unknown";
+  const forwarded = req.headers.get("x-forwarded-for")?.split(",").pop()?.trim();
+  return forwarded && ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(peer) ? forwarded : peer;
+}
+
+function redirect(location: string, cookies: string[] = []): Response {
+  const headers = new Headers({ location });
+  for (const c of cookies) headers.append("set-cookie", c);
+  return new Response(null, { status: 302, headers });
+}
+
+async function handleAuth(req: Request, url: URL, client: string): Promise<Response> {
+  if (url.pathname === "/auth/config" && req.method === "GET")
+    return json({ result: { github: Boolean(auth.config.github), githubUrl: auth.config.github?.url ?? null } });
+
+  if (url.pathname === "/auth/github" && req.method === "GET") {
+    if (!auth.config.github) return json({ error: { message: "GitHub login is not configured" } }, 404);
+    const state = randomBytes(24).toString("base64url");
+    return redirect(auth.githubAuthorizeUrl(state), [auth.cookie(auth.stateCookie, state, 600)]);
+  }
+
+  if (url.pathname === "/auth/github/callback" && req.method === "GET") {
+    if (!auth.config.github) return json({ error: { message: "GitHub login is not configured" } }, 404);
+    const clearState = auth.cookie(auth.stateCookie, "", 0);
+    const fail = (message: string) => redirect(`/#login-error=${encodeURIComponent(message)}`, [clearState]);
+    const expected = readCookie(req, auth.stateCookie);
+    const state = url.searchParams.get("state");
+    const code = url.searchParams.get("code");
+    // the state cookie binds the callback to the browser that started the login
+    if (!expected || !state || !code || !safeEqual(expected, state)) return fail("Login expired — try again");
+    try {
+      const profile = await auth.githubLogin(code);
+      // a service account must not be claimable by registering its name on GitHub
+      if ((store.user(profile.login)?.source ?? "github") !== "github")
+        return fail(`@${profile.login} collides with a service account on this server`);
+      store.upsertUser({
+        login: profile.login, source: "github", name: profile.name, avatar: profile.avatar, loggedIn: true,
+        role: auth.config.envAdmins.includes(profile.login) ? "admin" : "member",
+      });
+      if (store.user(profile.login)!.disabled) return fail(`@${profile.login} is disabled on this server`);
+      store.addEvent({ actor: profile.login, action: "login", detail: { via: "github", from: client } });
+      return redirect("/", [clearState, auth.startSession(profile.login)]);
+    } catch (e: any) {
+      log.warn(`github login refused: ${e?.message ?? e}`);
+      return fail(e instanceof RunoError ? e.message : "GitHub login failed");
+    }
+  }
+
+  // token -> session: the panel never keeps a token in the browser's storage
+  if (url.pathname === "/auth/token" && req.method === "POST") {
+    if (loginThrottle.blocked(client)) return json(TOO_MANY, 429);
+    if (!auth.csrfOk(req, url)) return json({ error: { message: "forbidden" } }, 403);
+    const { token } = (await req.json()) as { token?: string };
+    const who = typeof token === "string" && token ? auth.fromToken(token.trim()) : null;
+    if (!who) {
+      loginThrottle.fail(client);
+      return json({ error: { message: "invalid token" } }, 401);
+    }
+    store.addEvent({ actor: who.user, action: "login", detail: { via: "token", from: client } });
+    return new Response(JSON.stringify({ result: { user: who.user } }), {
+      headers: { "content-type": "application/json", "set-cookie": auth.startSession(who.user) },
+    });
+  }
+
+  if (url.pathname === "/auth/logout" && req.method === "POST") {
+    if (!auth.csrfOk(req, url)) return json({ error: { message: "forbidden" } }, 403);
+    return new Response(JSON.stringify({ result: null }), {
+      headers: { "content-type": "application/json", "set-cookie": auth.endSession(req) },
+    });
+  }
+  return json({ error: { message: "not found" } }, 404);
+}
+
+// ---------- fleet sampler (history, cost, peaks) ----------
+
+let sampling = false;
+async function sampleNow(): Promise<void> {
+  if (sampling) return;
+  sampling = true;
+  try {
+    await sampleFleet(store, await provider.listManaged(), Object.values(loadEnvs()), async (id) => {
+      const rt = await provider.status({ id, ip: null, state: "unknown" });
+      return rt.state === "terminated" || rt.state === "shutting-down";
+    });
+  } catch (e: any) {
+    log.warn(`fleet sample failed: ${e?.message ?? e}`);
+  } finally {
+    sampling = false;
+  }
+}
+
 // ---------- websocket tty (experimental) ----------
 
 interface TtyData {
@@ -348,22 +488,40 @@ const server = Bun.serve<TtyData>({
         return errResponse(e);
       }
     }
-    // web panel: static page, data itself still requires the token
-    if ((url.pathname === "/" || url.pathname === "/index.html") && req.method === "GET") {
-      const html = readFileSync(new URL("./panel.html", import.meta.url).pathname, "utf8");
-      return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
+    // web panel: static files, the data itself still requires a session or token
+    const asset = req.method === "GET" || req.method === "HEAD" ? PANEL_FILES[url.pathname] : undefined;
+    if (asset) {
+      const body = readFileSync(new URL(`./panel/${asset.file}`, import.meta.url).pathname);
+      return new Response(body, { headers: { "content-type": asset.type, "cache-control": "no-cache", ...PANEL_HEADERS } });
     }
-    if (url.pathname === "/v1/health" && req.method === "GET") {
-      const user = authUser(req, url);
-      if (!user) return json({ error: { message: "unauthorized" } }, 401);
-      return json({ ok: true, name: "runo-server", user });
+    if (url.pathname === "/favicon.ico") return new Response(null, { status: 204 });
+    const client = clientAddress(req, srv);
+    if (url.pathname.startsWith("/auth/")) {
+      try {
+        return await handleAuth(req, url, client);
+      } catch (e) {
+        return errResponse(e);
+      }
     }
-    const user = authUser(req, url);
-    if (!user) return json({ error: { message: "unauthorized" } }, 401);
+
+    // guessing is only worth throttling where the secret may be human-chosen (RUNO_SERVER_TOKENS)
+    const presentsToken = req.headers.has("authorization") || url.searchParams.has("token");
+    if (presentsToken && loginThrottle.blocked(client)) return json(TOO_MANY, 429);
+    const who = auth.identify(req, url);
+    if (!who) {
+      if (presentsToken) loginThrottle.fail(client);
+      return json({ error: { message: "unauthorized" } }, 401);
+    }
+    if (who.via === "session" && (!sessionMayCall(url.pathname) || !auth.csrfOk(req, url)))
+      return json({ error: { message: "This operation needs a CLI token, not a browser session" } }, 403);
+    const user = who.user;
+    if (url.pathname === "/v1/health" && req.method === "GET") return json({ ok: true, name: "runo-server", user });
 
     try {
+      const panel = await handlePanelApi({ store, auth, provider, region: AWS_REGION, ingressDomain: INGRESS_DOMAIN }, req, url, who);
+      if (panel) return panel;
       if (url.pathname === "/v1/rpc" && req.method === "POST")
-        return await handleRpc(user, await req.json());
+        return await handleRpc(who, await req.json());
       if (url.pathname === "/v1/exec" && req.method === "POST")
         return await handleExec(user, await req.json());
       if (url.pathname === "/v1/upload" && req.method === "POST") return await handleUpload(user, req, url);
@@ -372,15 +530,14 @@ const server = Bun.serve<TtyData>({
         const { id, members } = await req.json() as { id: string; members: string[] };
         const envs = loadEnvs();
         const env = requireAccess(user, id, Object.values(envs), true);
-        const known = new Set(tokens.values());
+        const known = auth.knownUsers();
         if (!Array.isArray(members) || members.some(m => typeof m !== "string" || !known.has(m)))
           throw new RunoError("members must contain registered user names");
         env.members = [...new Set(members)];
         saveEnvs(envs);
+        store.addEvent({ actor: user, action: "share", envName: env.envName, instanceId: env.instanceId, detail: { members: env.members } });
         return json({ result: null });
       }
-      if (url.pathname === "/v1/policies" && req.method === "GET")
-        return json({ result: loadPolicies() });
       if (url.pathname === "/v1/register-services" && req.method === "POST") {
         const { rt, services, recipe, urls } = (await req.json()) as {
           rt: Runtime;
@@ -401,7 +558,9 @@ const server = Bun.serve<TtyData>({
         return json({ error: { message: `no registered env for instance ${rt.id}` } }, 404);
       }
       if (url.pathname === "/v1/envs" && req.method === "GET") {
-        const envs = Object.values(loadEnvs()).filter(e => canAccess(user, e));
+        // all=1: the platform view — admins see every env (metadata and lifecycle, not the VM)
+        const everything = who.admin && url.searchParams.get("all") === "1";
+        const envs = Object.values(loadEnvs()).filter(e => everything || canAccess(user, e));
         if (url.searchParams.get("live") !== "1") return json({ result: envs });
         // enrich with live instance state for the panel
         const live = await Promise.all(
@@ -486,6 +645,8 @@ async function sweepTtl(): Promise<void> {
       const cur = loadEnvs();
       delete cur[e.envName];
       saveEnvs(cur);
+      store.endMachine(e.instanceId, "system", "ttl");
+      store.addEvent({ actor: "system", action: "ttl-destroy", envName: e.envName, instanceId: e.instanceId, detail: { owner: e.owner, ttlDays: pol.env_ttl_days } });
     } catch (err: any) {
       log.warn(`TTL destroy failed for ${e.envName}: ${err?.message ?? err}`);
     }
@@ -494,5 +655,14 @@ async function sweepTtl(): Promise<void> {
 setInterval(sweepTtl, 10 * 60_000);
 void sweepTtl();
 
-log.ok(`runo-server listening on :${server.port} (users: ${[...new Set(tokens.values())].join(", ")})`);
+setInterval(sampleNow, 60_000);
+setInterval(() => {
+  store.pruneSessions();
+  store.pruneSamples(Date.now() - 400 * 86_400_000);
+}, 3_600_000);
+void sampleNow();
+
+const gh = auth.config.github;
+log.ok(`runo-server listening on :${server.port} (token users: ${[...auth.config.envTokens.keys()].join(", ") || "none"})`);
+if (gh) log.dim(`GitHub login: ${[...gh.allowedOrgs.map((o) => `org ${o}`), ...gh.allowedUsers.map((u) => `@${u}`)].join(", ")}`);
 log.dim(`state: ${RUNO_HOME} — put TLS/VPN in front before exposing this beyond localhost`);

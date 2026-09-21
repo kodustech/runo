@@ -5,7 +5,9 @@ is authorized for this migration. Never use the default AWS profile.
 
 Server deployed: `i-0361a0dacfffae9b9`, t3.micro, encrypted 12 GiB gp3,
 Elastic IP `3.14.180.98` (`eipalloc-0f5f6524591ee0ae2`).
-HTTPS endpoint: https://3-14-180-98.sslip.io . The process runs as ubuntu under
+HTTPS endpoint: https://runo.kodus.io (Cloudflare A record, DNS only, → the
+Elastic IP; Caddy issues the certificate). https://3-14-180-98.sslip.io still
+answers until CI and QA move off it. The process runs as ubuntu under
 systemd, using about 37 MiB idle at the initial check. SSH is restricted to the
 operator's IP in `sg-06c6ce2083d7594d8`; there is no instance profile.
 
@@ -23,6 +25,24 @@ Run `bash deploy/check-isolated-access.sh` before cloud administration. It
 refuses other identities and never falls back to environment credentials or
 the default profile. Operator key and local QA configuration live in ignored
 `.runo-deploy/` with restricted permissions. Do not commit or print them.
+
+## Panel, login and updates
+
+People sign in at https://runo.kodus.io with GitHub (OAuth App "runo" in the
+kodustech org, callback `/auth/github/callback`); only active kodustech members
+get in. `RUNO_GITHUB_*`, `RUNO_PUBLIC_URL` and `RUNO_SERVER_ADMINS` live in
+/etc/runo-server.env. `preview-ci` and `qa` remain token identities in
+`RUNO_SERVER_TOKENS`; humans mint personal CLI tokens in the panel. History,
+users, sessions and hashed tokens are in /var/lib/runo-ohio/server.db — back it
+up with the rest of RUNO_HOME. How the panel works:
+[docs/control-plane-panel.md](../docs/control-plane-panel.md).
+
+Code-only updates: `bash deploy/update-server.sh` from the repo root. It runs
+the server tests, ships the working tree, keeps the env files and RUNO_HOME
+untouched, and restores the previous build if the new one does not come up.
+
+Offboarding: remove the person from the org AND disable them in settings →
+people (ends sessions and every token they minted).
 
 ## New server and environments
 

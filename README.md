@@ -299,7 +299,7 @@ runo up --here
 | `runo suspend` (hibernating 4GB RAM) | ~1m30 |
 | `runo bake` (one-time) | ~11min |
 
-## Teams: control plane (v0) — no AWS credentials on laptops
+## Teams: control plane — no AWS credentials on laptops
 
 For CI-created previews shared with QA agents, see
 [shared preview setup and migration](docs/shared-previews.md).
@@ -308,27 +308,44 @@ connects a checkout, and `runo share [user...]` sets collaborators (owner only).
 
 For solo use, the CLI talks to AWS directly with your local credentials. For
 teams, run **runo-server**: it holds the AWS credentials and the SSH keys;
-developers authenticate with a token and need **zero cloud credentials**.
+developers need **zero cloud credentials** — they sign in with GitHub and use a
+personal token.
 
 ```
 dev laptop (CLI, no AWS creds)          runo-server (control plane)
-  RemoteProvider ─── HTTP/WS ───►       token auth → EC2 provider + SSH keys
-  RUNO_SERVER + RUNO_TOKEN              per-user env registry (platform view)
+  RemoteProvider ─── HTTP/WS ───►       bearer token → EC2 provider + SSH keys
+  RUNO_SERVER + RUNO_TOKEN              env registry + history (server.db)
+browser ─── GitHub OAuth ───────►       web panel: envs, history, cost, settings
 ```
 
 Operator (platform team), on a machine that has AWS credentials:
 
 ```bash
 RUNO_HOME=~/.runo-server \
-RUNO_SERVER_TOKENS="alice:tok-a,bob:tok-b" \
+RUNO_PUBLIC_URL=https://runo.example.com \
+RUNO_GITHUB_CLIENT_ID=... RUNO_GITHUB_CLIENT_SECRET=... \
+RUNO_GITHUB_ALLOWED_ORGS=your-org \
+RUNO_SERVER_ADMINS=your-github-login \
+RUNO_SERVER_TOKENS="preview-ci:<long-random>" \
 bun server/main.ts --port 7777
 ```
 
-Developers:
+| Who | Signs in with | Gets |
+|---|---|---|
+| People | GitHub (active member of an allowed org, or a listed user) | the panel; mint their own CLI token there |
+| CI / agents | a token: `RUNO_SERVER_TOKENS`, or a service account created in the panel | the full API |
+| Teams without GitHub | tokens only — leave the `RUNO_GITHUB_*` variables out | the panel via "use an access token" |
+
+Setup (OAuth App, callback URL, GitHub Enterprise, what a browser session may
+and may not do, offboarding) is in
+[docs/control-plane-panel.md](docs/control-plane-panel.md).
+
+Developers — open the server's URL, sign in with GitHub, then settings → CLI
+tokens → create token (shown once):
 
 ```bash
-export RUNO_SERVER=https://runo.internal.example.com
-export RUNO_TOKEN=tok-a
+export RUNO_SERVER=https://runo.example.com
+export RUNO_TOKEN=runo_...
 runo new my-task        # same CLI, same flow — AWS stays server-side
 ```
 
@@ -341,9 +358,11 @@ runo new my-task        # same CLI, same flow — AWS stays server-side
   collisions), shareable links, and frontend API-base assumptions. Suspended
   env → friendly 503 telling you to `runo resume`. v0 proxies HTTP only
   (no WebSocket/HMR — use `runo tunnel` for that); terminate TLS in front.
-- **Web panel**: open `http://<server>:7777/` in a browser, paste your token —
-  live list of every env (owner, repo@branch, instance, state, public IP) with
-  auto-refresh and a destroy action. Same port, nothing else to deploy.
+- **Web panel**: open the server's URL in a browser and sign in — live envs
+  (suspend/resume/destroy), the history of every machine and who asked for it,
+  estimated cost by person/repo/instance type, fleet peaks, an audit trail, and
+  the settings an admin used to need SSH for. Same port, nothing else to
+  deploy. See [docs/control-plane-panel.md](docs/control-plane-panel.md).
 - `GET /v1/envs` (`?live=1` for instance state) is the same data as JSON.
 - The recipe stays committed in each repo: platform team writes it once by PR,
   devs never touch infra config.
@@ -357,9 +376,10 @@ runo new my-task        # same CLI, same flow — AWS stays server-side
   ceilings on what any recipe/user may ask for. Violations fail `runo new`
   instantly with an actionable message — before anything touches the cloud.
   `GET /v1/policies` shows the active policy set.
-- v0 is single-process with token auth and JSON state — put TLS/VPN
-  (ALB, Caddy, Tailscale) in front before exposing it beyond localhost.
-  SSO and a richer panel are the next iterations.
+- Single process; state is `server-envs.json` (what exists now) plus
+  `server.db` (SQLite: history, users, sessions, tokens — secrets hashed).
+  Login is GitHub OAuth restricted to your org/users, and/or bearer tokens.
+  Put TLS (Caddy, ALB, Tailscale) in front before exposing it beyond localhost.
 
 ## Security — accepted v1 limitations (documented on purpose)
 

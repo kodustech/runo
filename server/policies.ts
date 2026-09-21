@@ -6,9 +6,9 @@
  * File: $RUNO_HOME/policies.yaml (re-read on every request — edits apply
  * immediately, no restart). Every field is optional; absent = unlimited.
  */
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { parse } from "yaml";
+import { parse, stringify } from "yaml";
 import { RUNO_HOME } from "../src/config";
 import { RunoError } from "../src/errors";
 import type { CreateSpec } from "../src/provider/types";
@@ -36,6 +36,41 @@ export function loadPolicies(): Policies {
   } catch (e: any) {
     throw new RunoError(`policies.yaml does not parse: ${e?.message ?? e}`, `Fix ${p}`);
   }
+}
+
+/** Validates a policy document coming from the panel; absent/null fields mean unlimited. */
+export function parsePolicies(input: any): Policies {
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw new RunoError("policies must be an object");
+  const known = ["allowed_instance_types", "max_disk_gb", "max_envs_per_user", "max_running_total", "env_ttl_days"];
+  const unknown = Object.keys(input).filter((k) => !known.includes(k));
+  if (unknown.length) throw new RunoError(`Unknown policy: ${unknown.join(", ")}`);
+  const out: Policies = {};
+  const types = input.allowed_instance_types;
+  if (types !== undefined && types !== null) {
+    if (!Array.isArray(types) || !types.length || types.some((t) => typeof t !== "string" || !/^[a-z0-9-]+\.[a-z0-9]+$/.test(t)))
+      throw new RunoError("allowed_instance_types must be a non-empty list of instance types (e.g. t3.large)");
+    out.allowed_instance_types = [...new Set(types as string[])];
+  }
+  for (const field of ["max_disk_gb", "max_envs_per_user", "max_running_total"] as const) {
+    const v = input[field];
+    if (v === undefined || v === null) continue;
+    if (!Number.isInteger(v) || v < 1) throw new RunoError(`${field} must be a positive integer`);
+    out[field] = v;
+  }
+  const ttl = input.env_ttl_days;
+  if (ttl !== undefined && ttl !== null) {
+    if (typeof ttl !== "number" || !Number.isFinite(ttl) || ttl <= 0) throw new RunoError("env_ttl_days must be a positive number");
+    out.env_ttl_days = ttl;
+  }
+  return out;
+}
+
+/** Atomic replace — a crash mid-write must not leave a policies.yaml that blocks every create. */
+export function savePolicies(pol: Policies): void {
+  const p = POLICIES_PATH();
+  mkdirSync(path.dirname(p), { recursive: true });
+  writeFileSync(`${p}.tmp`, stringify(pol), { mode: 0o600 });
+  renameSync(`${p}.tmp`, p);
 }
 
 export function enforceCreate(
