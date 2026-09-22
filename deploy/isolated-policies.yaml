@@ -1,4 +1,4 @@
 allowed_instance_types: [t3.medium, t3.large, t3.xlarge, t3a.medium, t3a.large, t3a.xlarge]
 max_disk_gb: 100
-max_envs_per_user: 3
-max_running_total: 3
+max_envs_per_user: 5
+max_running_total: 5

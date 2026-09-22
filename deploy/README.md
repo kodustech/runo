@@ -73,7 +73,7 @@ people (ends sessions and every token they minted).
    retiring old Runo resources. New previews do not migrate database data;
    explicitly preserve any necessary fixtures before cleanup.
 
-The initial policy caps running previews at three. The USD 150 budget is an
+The policy caps running previews at five (raised from three on 2026-09-22, when a pull request started to be able to own a cloud AND a self-hosted preview). The USD 150 budget is an
 alert, not an automatic spending limit. Monitor runtime and CPU credit charges.
 
 ## Old Runo resources
