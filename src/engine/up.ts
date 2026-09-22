@@ -30,6 +30,7 @@ function baseRecord(ctx: EnvContext): EnvRecord {
       repoPath: ctx.repoPath,
       branch: ctx.branch,
       slug: ctx.slug,
+      profile: ctx.profile,
       worktree: ctx.worktree,
       externalWorktree: ctx.externalWorktree,
       provider: "aws",
@@ -266,9 +267,9 @@ export async function upEnv(ctx: EnvContext): Promise<EnvRecord> {
   // truth, so adopt what the branch already has instead of paying for a second
   // VM (and leaking the first).
   if (!(env.runtime as any)?.id && provider.findByTags) {
-    const found = await provider.findByTags(ctx.repoName, ctx.branch);
+    const found = await provider.findByTags(ctx.repoName, ctx.branch, ctx.profile);
     if (found) {
-      log.step(`adopting the existing instance for ${ctx.branch} (${found.id}, ${found.state})`);
+      log.step(`adopting the existing instance for ${ctx.branch}${ctx.profile ? ` (${ctx.profile})` : ""} (${found.id}, ${found.state})`);
       adopted = true;
       env = registry.upsert({
         ...env,
@@ -303,6 +304,7 @@ export async function upEnv(ctx: EnvContext): Promise<EnvRecord> {
       diskGb: ctx.recipe.limits.diskGb,
       repo: ctx.repoName,
       branch: ctx.branch,
+      profile: ctx.profile,
       spot: ctx.recipe.limits.spot,
     });
     env = registry.upsert({

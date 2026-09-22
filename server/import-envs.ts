@@ -31,6 +31,7 @@ do {
     }
     envs[name] = {
       envName: name, slug: tags["runo:env"], repo, branch: tags["runo:branch"],
+      ...(tags["runo:profile"] ? { profile: tags["runo:profile"] } : {}),
       owner, members: [], instanceId: vm.InstanceId, instanceType: vm.InstanceType,
       spot: vm.InstanceLifecycle === "spot", recipe, createdAt: vm.LaunchTime?.toISOString(),
     };

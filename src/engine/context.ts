@@ -1,5 +1,5 @@
 import path from "node:path";
-import { WORKTREES_DIR, envNameFor, slugify } from "../config";
+import { WORKTREES_DIR, envNameFor, profileFromEnv, slugFor } from "../config";
 import { RunoError } from "../errors";
 import { loadRecipe, loadRecipeFrom, type NormalizedRecipe } from "../recipe";
 import { registry, type EnvRecord } from "../registry";
@@ -30,6 +30,8 @@ export interface EnvContext {
   repoName: string;
   branch: string;
   slug: string;
+  /** Second identity axis: see slugFor in config. */
+  profile?: string;
   envName: string;
   worktree: string;
   externalWorktree?: boolean; // worktree owned by an external tool (runo up --here)
@@ -41,30 +43,35 @@ export function worktreePathFor(repoName: string, slug: string): string {
   return path.join(WORKTREES_DIR, `${repoName}-${slug}`);
 }
 
-/** Builds an env context from the original repo + branch. */
-export function buildContext(repoPath: string, branch: string): EnvContext {
+/** Builds an env context from the original repo + branch (+ profile). */
+export function buildContext(repoPath: string, branch: string, profile = profileFromEnv()): EnvContext {
   const repoName = path.basename(repoPath);
-  const slug = slugify(branch);
+  const slug = slugFor(branch, profile);
   const worktree = worktreePathFor(repoName, slug);
   // recipe: worktree first (if it already exists), then the original repo —
   // covers untracked recipes
   const { recipe, path: recipePath } = loadRecipe(worktree, repoPath);
-  return { repoPath, repoName, branch, slug, envName: envNameFor(slug), worktree, recipe, recipePath };
+  return { repoPath, repoName, branch, slug, profile, envName: envNameFor(slug), worktree, recipe, recipePath };
 }
 
 /**
  * `runo up --here`: the CURRENT working tree is the sync anchor — for tools
  * that own their worktrees (Orca, plain checkouts). runo never removes it.
  */
-export function buildContextHere(worktreePath: string, branch: string): EnvContext {
+export function buildContextHere(
+  worktreePath: string,
+  branch: string,
+  profile = profileFromEnv(),
+): EnvContext {
   const repoName = path.basename(worktreePath);
-  const slug = slugify(branch);
+  const slug = slugFor(branch, profile);
   const { recipe, path: recipePath } = loadRecipe(worktreePath);
   return {
     repoPath: worktreePath,
     repoName,
     branch,
     slug,
+    profile,
     envName: envNameFor(slug),
     worktree: worktreePath,
     externalWorktree: true,
@@ -80,8 +87,10 @@ export function contextFromEnv(env: EnvRecord): EnvContext {
     repoName: env.repo,
     branch: env.branch,
     slug: env.slug,
+    profile: env.profile,
     envName: env.name,
     worktree: env.worktree,
+    externalWorktree: env.externalWorktree,
     recipe,
     recipePath,
   };
@@ -89,25 +98,28 @@ export function contextFromEnv(env: EnvRecord): EnvContext {
 
 /**
  * Resolves which env a command targets: cwd inside a runo worktree >
- * cwd's repo+branch > --branch within the cwd's repo.
+ * cwd's repo+branch > --branch within the cwd's repo. A branch with several
+ * profiles needs --profile (RUNO_PROFILE) to pick one, unless the cwd is a
+ * runo-owned worktree, which belongs to exactly one env.
  */
-export function resolveEnv(opts: { branch?: string } = {}): EnvRecord {
+export function resolveEnv(opts: { branch?: string; profile?: string } = {}): EnvRecord {
   const cwd = process.cwd();
+  const profile = opts.profile ?? profileFromEnv();
   const byWorktree = registry.findByCwd(cwd);
   if (byWorktree?.server && byWorktree.server !== process.env.RUNO_SERVER?.replace(/\/+$/, ""))
     throw new RunoError(`This checkout is attached to ${byWorktree.server}; set RUNO_SERVER accordingly`);
-  if (byWorktree && !opts.branch) return byWorktree;
+  // A runo-created worktree is one env; an external one (--here, attach) may
+  // anchor one env per profile, so only trust it when the profile agrees.
+  if (byWorktree && !opts.branch && (profile === undefined || byWorktree.profile === profile)) return byWorktree;
 
   const top = repoTop(cwd);
   if (top) {
     const branch = opts.branch ?? (byWorktree ? byWorktree.branch : currentBranch(top));
-    const found =
-      registry.findByRepoBranch(top, branch) ??
-      registry.list().find((e) => e.branch === branch && (top === e.repoPath || top === e.worktree));
+    const found = registry.findByRepoBranch(top, branch, profile);
     if (found) return found;
-    if (byWorktree) return byWorktree;
+    if (byWorktree && profile === undefined) return byWorktree;
     throw new RunoError(
-      `No environment registered for ${path.basename(top)} @ ${branch}`,
+      `No environment registered for ${path.basename(top)} @ ${branch}${profile ? ` (profile ${profile})` : ""}`,
       "Create one with `runo new <name>` (or list existing envs with `runo ls`)",
     );
   }

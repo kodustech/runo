@@ -51,6 +51,18 @@ After `runo up` succeeds, grant access explicitly:
 $RUNO share qa --branch "$HEAD_REF"
 ```
 
+A pull request that needs more than one shape of the product gets one
+environment per profile from the same checkout; the profile is part of the
+environment's identity, so both coexist and cleanup without a profile takes
+every one of them:
+
+```bash
+$RUNO up --here --branch "$HEAD_REF" --profile cloud --recipe .kodus/workspace.preview.cloud.yaml
+$RUNO up --here --branch "$HEAD_REF" --profile self-hosted --recipe .kodus/workspace.preview.selfhosted.yaml
+$RUNO share qa --branch "$HEAD_REF" --profile cloud
+$RUNO destroy --branch "$HEAD_REF"          # both
+```
+
 `share` replaces the entire collaborator list; `runo share` with no users
 revokes all collaborators. A later deploy preserves membership unless CI calls
 share again. Server discovery lists only owned/shared environments.

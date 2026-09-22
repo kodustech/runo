@@ -9,6 +9,8 @@ export interface CreateSpec {
   diskGb: number;
   repo: string;
   branch: string;
+  /** Second identity axis of the env (see slugFor); absent = no profile. */
+  profile?: string;
   /** Spot capacity (interruption = stop, data survives; on-demand fallback). */
   spot?: boolean;
 }
@@ -122,9 +124,17 @@ export interface RuntimeProvider {
 
   /**
    * The env's instance located by its tags — lets a machine with no local
-   * registry (a CI runner) find the env its branch already has.
+   * registry (a CI runner) find the env its branch already has. The profile
+   * is part of the match: `undefined` finds the branch's profile-less env
+   * only, never a profiled one (two profiles of a branch are two envs).
    */
-  findByTags?(repo: string, branch: string): Promise<Runtime | null>;
+  findByTags?(repo: string, branch: string, profile?: string): Promise<Runtime | null>;
+
+  /**
+   * Every env of the branch, whatever its profile (each Runtime carries its
+   * `profile`, when it has one) — a teardown without --profile takes them all.
+   */
+  listByBranch?(repo: string, branch: string): Promise<Runtime[]>;
 
   /** All runo-managed instances still alive (guardrail + audit). */
   listManaged(): Promise<Runtime[]>;

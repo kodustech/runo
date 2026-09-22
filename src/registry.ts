@@ -1,6 +1,16 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { RUNO_HOME, REGISTRY_PATH } from "./config";
+import { RunoError } from "./errors";
+
+export class AmbiguousEnvError extends RunoError {
+  constructor(branch: string, profiles: string[]) {
+    super(
+      `${branch} has more than one environment (profiles: ${profiles.join(", ")})`,
+      "Pick one with --profile <name> (or RUNO_PROFILE)",
+    );
+  }
+}
 
 export interface PublicService {
   name: string;
@@ -15,6 +25,9 @@ export interface EnvRecord {
   repoPath: string;
   branch: string;
   slug: string;
+  /** Second identity axis (--profile): one branch may own one env per
+   * profile. Absent for envs created without one. */
+  profile?: string;
   worktree: string;
   provider: string; // "aws"
   server?: string;
@@ -75,10 +88,23 @@ export const registry = {
     return loadFile().envs[name];
   },
 
-  findByRepoBranch(repoPath: string, branch: string): EnvRecord | undefined {
-    return this.list().find(
+  /** Every env of the branch, whatever its profile. */
+  listByRepoBranch(repoPath: string, branch: string): EnvRecord[] {
+    return this.list().filter(
       (e) => (e.repoPath === repoPath || e.worktree === repoPath) && e.branch === branch,
     );
+  },
+
+  /**
+   * The branch's env. With a profile, that profile's env; without one, the
+   * branch's only env — two envs of the same branch need the profile to tell
+   * them apart, and guessing would push code to the wrong machine.
+   */
+  findByRepoBranch(repoPath: string, branch: string, profile?: string): EnvRecord | undefined {
+    const all = this.listByRepoBranch(repoPath, branch);
+    if (profile !== undefined) return all.find((e) => e.profile === profile);
+    if (all.length <= 1) return all[0];
+    throw new AmbiguousEnvError(branch, all.map((e) => e.profile ?? "(none)"));
   },
 
   findByCwd(cwd: string): EnvRecord | undefined {

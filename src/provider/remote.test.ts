@@ -76,3 +76,27 @@ test("CLI attaches a fresh checkout and executes on the shared VM without SSH ke
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("two profiles of one branch are two environments on the control plane", async () => {
+  const server = Bun.serve({ port: 0, async fetch(req) {
+    if (new URL(req.url).pathname === "/v1/envs")
+      return Response.json({ result: [
+        { envName: "pr-1-cloud", repo: "kodus-ai", branch: "fix/test", profile: "cloud", instanceId: "i-cloud" },
+        { envName: "pr-1-self-hosted", repo: "kodus-ai", branch: "fix/test", profile: "self-hosted", instanceId: "i-self" },
+        { envName: "pr-2", repo: "kodus-ai", branch: "fix/other", instanceId: "i-plain" },
+      ] });
+    const body = await req.json();
+    return Response.json({ result: { id: body.args[0].id, ip: "127.0.0.1", state: "running" } });
+  }});
+  try {
+    const provider = new RemoteProvider(server.url.toString(), "qa-token");
+    expect((await provider.findByTags("kodus-ai", "fix/test", "cloud"))?.id).toBe("i-cloud");
+    expect((await provider.findByTags("kodus-ai", "fix/test", "self-hosted"))?.id).toBe("i-self");
+    // no profile never adopts a profiled env, and a profile never adopts a plain one
+    expect(await provider.findByTags("kodus-ai", "fix/test")).toBeNull();
+    expect(await provider.findByTags("kodus-ai", "fix/other", "cloud")).toBeNull();
+    expect((await provider.findByTags("kodus-ai", "fix/other"))?.id).toBe("i-plain");
+    const all = await provider.listByBranch("kodus-ai", "fix/test");
+    expect(all.map((rt) => [rt.id, rt.profile])).toEqual([["i-cloud", "cloud"], ["i-self", "self-hosted"]]);
+  } finally { server.stop(true); }
+});

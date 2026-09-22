@@ -223,13 +223,19 @@ export function parseRecipe(yamlText: string, source: string): NormalizedRecipe 
 }
 
 /**
- * Which recipe file to read. One repo can describe more than one kind of
- * environment — a developer box and a PR preview are not the same machine —
- * so `--recipe` (RUNO_RECIPE) picks the shape without touching the default.
+ * Which recipe files to try, in order. One repo can describe more than one
+ * kind of environment — a developer box and a PR preview are not the same
+ * machine — so `--recipe` (RUNO_RECIPE) picks the shape without touching the
+ * default. A `--profile` (RUNO_PROFILE) without an explicit recipe looks for
+ * `.kodus/workspace.<profile>.yaml` first and falls back to the default, so a
+ * profile that only changes the compose overlay does not need its own file.
  */
-function recipeRelPath(): string {
+export function recipeCandidates(remembered?: string): string[] {
   const override = process.env.RUNO_RECIPE?.trim();
-  return override && override.length > 0 ? override : RECIPE_REL_PATH;
+  if (override) return [override];
+  if (remembered) return [remembered];
+  const profile = process.env.RUNO_PROFILE?.trim();
+  return profile ? [`.kodus/workspace.${profile}.yaml`, RECIPE_REL_PATH] : [RECIPE_REL_PATH];
 }
 
 /** Loads the recipe from the first directory that has it. */
@@ -247,17 +253,19 @@ export function loadRecipeFrom(
   remembered: string | undefined,
   dirs: string[],
 ): { recipe: NormalizedRecipe; path: string } {
-  const rel = process.env.RUNO_RECIPE?.trim() || remembered || RECIPE_REL_PATH;
-  if (path.isAbsolute(rel)) {
-    if (!existsSync(rel)) throw new RunoError(`Recipe not found: ${rel}`);
-    return { recipe: parseRecipe(readFileSync(rel, "utf8"), rel), path: rel };
-  }
-  for (const dir of dirs) {
-    const p = path.join(dir, rel);
-    if (existsSync(p)) return { recipe: parseRecipe(readFileSync(p, "utf8"), p), path: p };
+  const candidates = recipeCandidates(remembered);
+  for (const rel of candidates) {
+    if (path.isAbsolute(rel)) {
+      if (!existsSync(rel)) throw new RunoError(`Recipe not found: ${rel}`);
+      return { recipe: parseRecipe(readFileSync(rel, "utf8"), rel), path: rel };
+    }
+    for (const dir of dirs) {
+      const p = path.join(dir, rel);
+      if (existsSync(p)) return { recipe: parseRecipe(readFileSync(p, "utf8"), p), path: p };
+    }
   }
   throw new RunoError(
-    `No recipe found (${rel}) in: ${dirs.join(", ")}`,
+    `No recipe found (${candidates.join(" or ")}) in: ${dirs.join(", ")}`,
     process.env.RUNO_RECIPE
       ? "Check the --recipe path (it is relative to the repo root)"
       : "Run `runo init` at the repo root to generate a proposal",

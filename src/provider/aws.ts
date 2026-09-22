@@ -306,6 +306,7 @@ export class Ec2Provider implements RuntimeProvider {
       { Key: "runo:home-hash", Value: HASH6 },
       { Key: "runo:repo", Value: spec.repo },
       { Key: "runo:branch", Value: spec.branch },
+      ...(spec.profile ? [{ Key: "runo:profile", Value: spec.profile }] : []),
     ];
   }
 
@@ -466,6 +467,7 @@ export class Ec2Provider implements RuntimeProvider {
   private mapInstance(i: Instance | undefined, id: string): Runtime {
     if (!i) return { id, ip: null, state: "terminated" };
     const nameTag = i.Tags?.find((t) => t.Key === "Name")?.Value;
+    const profileTag = i.Tags?.find((t) => t.Key === "runo:profile")?.Value;
     return {
       id,
       ip: i.PublicIpAddress ?? null,
@@ -475,6 +477,7 @@ export class Ec2Provider implements RuntimeProvider {
       name: nameTag,
       lifecycle: i.InstanceLifecycle, // "spot" | undefined (on-demand)
       spotRequestId: i.SpotInstanceRequestId,
+      ...(profileTag ? { profile: profileTag } : {}),
     };
   }
 
@@ -977,7 +980,14 @@ export class Ec2Provider implements RuntimeProvider {
    * a CI runner is a fresh machine on every job, and creating a second VM for
    * a branch that already has one is both wrong and expensive.
    */
-  async findByTags(repo: string, branch: string): Promise<Runtime | null> {
+  async findByTags(repo: string, branch: string, profile?: string): Promise<Runtime | null> {
+    // The profile tag cannot be filtered server-side for "absent", so match
+    // it here: a profile-less lookup must not adopt a profiled env.
+    const found = (await this.listByBranch(repo, branch)).find((rt) => (rt.profile ?? undefined) === profile);
+    return found ?? null;
+  }
+
+  async listByBranch(repo: string, branch: string): Promise<Runtime[]> {
     const res = await this.ec2.send(
       new DescribeInstancesCommand({
         Filters: [
@@ -989,10 +999,10 @@ export class Ec2Provider implements RuntimeProvider {
         ],
       }),
     );
-    const found = (res.Reservations ?? [])
+    return (res.Reservations ?? [])
       .flatMap((r) => r.Instances ?? [])
-      .sort((a, b) => (b.LaunchTime?.getTime() ?? 0) - (a.LaunchTime?.getTime() ?? 0))[0];
-    return found ? this.mapInstance(found, found.InstanceId!) : null;
+      .sort((a, b) => (b.LaunchTime?.getTime() ?? 0) - (a.LaunchTime?.getTime() ?? 0))
+      .map((i) => this.mapInstance(i, i.InstanceId!));
   }
 
   async listManaged(): Promise<Runtime[]> {
