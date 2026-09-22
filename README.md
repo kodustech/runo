@@ -47,6 +47,7 @@ Environment variables:
 | `RUNO_AWS_REGION` | `sa-east-1` | EC2 region (us-east-1 is ~40% cheaper if latency is acceptable) |
 | `RUNO_DEBUG` | — | `1` prints stack traces |
 | `RUNO_RECIPE` | `.kodus/workspace.yaml` | which recipe to read (same as `--recipe`) — one repo can describe a dev box AND a PR preview |
+| `RUNO_PROFILE` | — | env profile (same as `--profile`): one env PER PROFILE of a branch — see "Profiles" |
 | `RUNO_SSH_KEY` | — | private key as a value instead of a file, for machines with no `$RUNO_HOME` (CI) |
 | `RUNO_MAX_INSTANCES` | `3` | ceiling on simultaneous RUNNING instances |
 | `CLOUDFLARE_API_TOKEN` | — | only for `expose.domain` (named tunnels) |
@@ -72,7 +73,42 @@ Environment variables:
 | `runo suspend` / `runo resume` | stop/start the EC2 instance (stopped costs no compute; **the IP changes** and runo redetects it) |
 | `runo bake [--rm]` | bakes an AMI with provisioning done (~10-12min, once): subsequent `runo up` boot in ~1-2min instead of ~6. `--rm` removes image/snapshot |
 | `runo pool [n]` | warm pool: n provisioned, **stopped** instances (EBS only, ~US$3/mo each); `runo new` claims one — adjusts type/disk while stopped and starts it (~40-60s). No arg shows status; `0` drains |
-| `runo destroy [--all]` | terminates the instance (EBS included), removes worktree and registry; `--all` also removes keypair + SG |
+| `runo destroy [--all]` | terminates the instance (EBS included), removes worktree and registry; `--all` also removes keypair + SG. `--branch B` without `--profile` destroys every profile of the branch |
+
+Every command accepts `--branch <B>` (which env) and `--profile <name>` (which
+profile of that branch — see below).
+
+## Profiles: several envs of one branch
+
+A branch normally has one env. Some changes need the same code materialized
+more than once — Kodus runs a **cloud** shape (billing, analytics) and a
+**self-hosted** shape, and a pull request may need one, the other or both.
+`--profile` (or `RUNO_PROFILE`) makes the profile part of the env's identity:
+the env name, the VM name and tags, the worktree, the tunnel or ingress
+hostname and the registry all split by profile, and an env created without
+one keeps every identifier exactly as before.
+
+```bash
+runo up --here --branch "$HEAD_REF" --profile cloud        # env <slug>-cloud
+runo up --here --branch "$HEAD_REF" --profile self-hosted  # env <slug>-self-hosted, same VM size rules
+runo logs --branch "$HEAD_REF" --profile cloud             # commands need the profile once a branch has two
+runo destroy --branch "$HEAD_REF"                          # takes every profile of the branch
+```
+
+- **Recipe**: `--profile X` without `--recipe` reads `.kodus/workspace.X.yaml`
+  when it exists and falls back to `.kodus/workspace.yaml`. `--recipe` always
+  wins, so `--profile cloud --recipe .kodus/workspace.preview.cloud.yaml` is
+  the CI form. The env remembers its recipe either way.
+- **Lookup**: a branch with several profiles refuses to guess — `runo push`
+  without `--profile` fails with the list of profiles instead of syncing the
+  wrong machine. Inside a runo-created worktree the profile is implied.
+- **Dev boxes**: git allows one worktree per branch, so two profiles of the
+  same branch on a laptop need `runo up --here` from separate checkouts (an
+  Orca worktree per profile, for instance). CI, which always uses `--here`,
+  has no such limit.
+- **Control plane**: the server keys envs by repo + branch + profile, shows
+  the profile in the panel and in `runo environments`, and `runo attach`
+  records it.
 
 ## Recipe (`.kodus/workspace.yaml`, schema v1)
 

@@ -306,6 +306,7 @@ export class Ec2Provider implements RuntimeProvider {
       { Key: "runo:home-hash", Value: HASH6 },
       { Key: "runo:repo", Value: spec.repo },
       { Key: "runo:branch", Value: spec.branch },
+      ...(spec.profile ? [{ Key: "runo:profile", Value: spec.profile }] : []),
     ];
   }
 
@@ -460,12 +461,26 @@ export class Ec2Provider implements RuntimeProvider {
       repo: spec.repo,
     });
     log.dim(`instance ${id} created (${spec.instanceType}, ${spec.diskGb}GB gp3, ${AWS_REGION})`);
-    return await this.waitForState(id, "running", 5 * 60_000, true);
+    try {
+      return await this.waitForState(id, "running", 5 * 60_000, true);
+    } catch (e) {
+      // The caller never learns this id when create fails, so nothing would
+      // ever terminate it: an instance that did not come up must not outlive
+      // the error that reported it.
+      log.warn(`instance ${id} did not come up — terminating it so it cannot leak`);
+      try {
+        await this.ec2.send(new TerminateInstancesCommand({ InstanceIds: [id] }));
+      } catch (cleanup: any) {
+        log.warn(`could not terminate ${id}: ${cleanup?.message ?? cleanup} — terminate it by hand`);
+      }
+      throw e;
+    }
   }
 
   private mapInstance(i: Instance | undefined, id: string): Runtime {
     if (!i) return { id, ip: null, state: "terminated" };
     const nameTag = i.Tags?.find((t) => t.Key === "Name")?.Value;
+    const profileTag = i.Tags?.find((t) => t.Key === "runo:profile")?.Value;
     return {
       id,
       ip: i.PublicIpAddress ?? null,
@@ -475,6 +490,7 @@ export class Ec2Provider implements RuntimeProvider {
       name: nameTag,
       lifecycle: i.InstanceLifecycle, // "spot" | undefined (on-demand)
       spotRequestId: i.SpotInstanceRequestId,
+      ...(profileTag ? { profile: profileTag } : {}),
     };
   }
 
@@ -485,10 +501,18 @@ export class Ec2Provider implements RuntimeProvider {
       const res = await this.ec2.send(new DescribeInstancesCommand({ InstanceIds: [id] }));
       return this.mapInstance(res.Reservations?.[0]?.Instances?.[0], id);
     } catch (e: any) {
-      if (errCode(e) === "InvalidInstanceID.NotFound") return { id, ip: null, state: "terminated" };
+      // Gone for good — or not born yet: DescribeInstances is eventually
+      // consistent and can answer NotFound for a few seconds after
+      // RunInstances. Callers that just launched the instance check the flag.
+      if (errCode(e) === "InvalidInstanceID.NotFound") return { id, ip: null, state: "terminated", notFound: true };
       throw e;
     }
   }
+
+  /** Poll interval of waitForState; a test shortens it. */
+  private pollMs = 5000;
+  /** How long a just-launched instance may answer NotFound before it counts as gone. */
+  private static readonly NOT_FOUND_GRACE_MS = 90_000;
 
   private async waitForState(
     id: string,
@@ -496,14 +520,24 @@ export class Ec2Provider implements RuntimeProvider {
     timeoutMs: number,
     requireIp = false,
   ): Promise<Runtime> {
-    const deadline = Date.now() + timeoutMs;
+    const started = Date.now();
+    const deadline = started + timeoutMs;
     let last: Runtime = { id, ip: null, state: "unknown" };
+    let seen = false; // described at least once — NotFound after that is a real termination
     while (Date.now() < deadline) {
       last = await this.describe(id);
+      if (last.notFound && !seen && Date.now() - started < Ec2Provider.NOT_FOUND_GRACE_MS) {
+        // RunInstances returned this id seconds ago; DescribeInstances has
+        // not caught up yet. Treating that as "terminated" leaks a running
+        // VM nobody has a record of.
+        await sleep(this.pollMs);
+        continue;
+      }
+      seen = seen || !last.notFound;
       if (last.state === want && (!requireIp || last.ip)) return last;
       if (want !== "terminated" && (last.state === "terminated" || last.state === "shutting-down"))
         throw new RunoError(`Instance ${id} terminated unexpectedly (state: ${last.state})`);
-      await sleep(5000);
+      await sleep(this.pollMs);
     }
     throw new RunoError(
       `Timed out waiting for instance ${id} to reach "${want}" (last state: ${last.state})`,
@@ -977,7 +1011,14 @@ export class Ec2Provider implements RuntimeProvider {
    * a CI runner is a fresh machine on every job, and creating a second VM for
    * a branch that already has one is both wrong and expensive.
    */
-  async findByTags(repo: string, branch: string): Promise<Runtime | null> {
+  async findByTags(repo: string, branch: string, profile?: string): Promise<Runtime | null> {
+    // The profile tag cannot be filtered server-side for "absent", so match
+    // it here: a profile-less lookup must not adopt a profiled env.
+    const found = (await this.listByBranch(repo, branch)).find((rt) => (rt.profile ?? undefined) === profile);
+    return found ?? null;
+  }
+
+  async listByBranch(repo: string, branch: string): Promise<Runtime[]> {
     const res = await this.ec2.send(
       new DescribeInstancesCommand({
         Filters: [
@@ -989,10 +1030,10 @@ export class Ec2Provider implements RuntimeProvider {
         ],
       }),
     );
-    const found = (res.Reservations ?? [])
+    return (res.Reservations ?? [])
       .flatMap((r) => r.Instances ?? [])
-      .sort((a, b) => (b.LaunchTime?.getTime() ?? 0) - (a.LaunchTime?.getTime() ?? 0))[0];
-    return found ? this.mapInstance(found, found.InstanceId!) : null;
+      .sort((a, b) => (b.LaunchTime?.getTime() ?? 0) - (a.LaunchTime?.getTime() ?? 0))
+      .map((i) => this.mapInstance(i, i.InstanceId!));
   }
 
   async listManaged(): Promise<Runtime[]> {

@@ -21,6 +21,7 @@ async function withServer(run: (request: Call, port: string) => Promise<void>): 
         async listManaged() { return [{ id: "i-preview", ip: "192.0.2.10", state: "running" }]; }
         async suspend(rt) { return { ...rt, state: "stopped" }; }
         async destroy() {}
+        async create(spec) { return { id: "i-" + spec.slug, ip: "192.0.2.11", state: "running", instanceType: spec.instanceType }; }
         async poolStatus() { return []; }
         async ensurePorts() {}
       }
@@ -124,4 +125,20 @@ test("a browser session runs the panel but cannot reach a VM, skip CSRF, or act 
 
   await session("/auth/logout", "POST");
   expect((await session("/v1/me")).status).toBe(401);
+}), 15000);
+
+test("a branch may own one environment per profile, never two of the same", () => withServer(async (request) => {
+  const spec = (profile?: string) => ({
+    envName: profile ? `preview-${profile}` : "preview-again", slug: profile ? `pr-1-${profile}` : "pr-1",
+    repo: "app", branch: "pr-1", instanceType: "t3.micro", diskGb: 20, ...(profile ? { profile } : {}),
+  });
+  // "preview" (app@pr-1, no profile) already exists: a second profile-less env is refused
+  expect((await request("/v1/rpc", "ci", { method: "create", args: [spec()] })).ok).toBe(false);
+  expect((await request("/v1/rpc", "ci", { method: "create", args: [spec("cloud")] })).ok).toBe(true);
+  expect((await request("/v1/rpc", "ci", { method: "create", args: [spec("self-hosted")] })).ok).toBe(true);
+  expect((await request("/v1/rpc", "ci", { method: "create", args: [spec("cloud")] })).ok).toBe(false);
+  const envs = (await (await request("/v1/envs", "ci")).json() as any).result;
+  expect(envs.map((e: any) => [e.envName, e.profile ?? null]).sort()).toEqual([
+    ["preview", null], ["preview-cloud", "cloud"], ["preview-self-hosted", "self-hosted"],
+  ]);
 }), 15000);

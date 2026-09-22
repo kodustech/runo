@@ -206,7 +206,7 @@ const views = {
         ${e.state === "stopped" ? `<button data-action="resume" data-id="${id}" data-name="${name}">resume</button>` : ""}
         <button class="danger" data-action="destroy" data-id="${id}" data-name="${name}">destroy</button>`;
       return `<tr><td>${name}</td><td>${esc(e.owner)}${e.members?.length ? ` <span class="dim">+${esc(e.members.join(", "))}</span>` : ""}</td>
-        <td>${esc(e.repo)} @ ${esc(e.branch)}</td><td>${esc(e.instanceType)}${e.spot ? ' <span class="tag">spot</span>' : ""}</td>
+        <td>${esc(e.repo)} @ ${esc(e.branch)}${e.profile ? ` <span class="tag">${esc(e.profile)}</span>` : ""}</td><td>${esc(e.instanceType)}${e.spot ? ' <span class="tag">spot</span>' : ""}</td>
         <td>${stateTag(e.state)}</td>
         <td>${e.url ? `<a href="${esc(e.url)}" target="_blank" rel="noopener noreferrer">${esc(e.slug)}</a>` : esc(e.ip ?? "-")}</td>
         <td>${esc(when(Date.parse(e.createdAt)))}</td><td class="row">${actions}</td></tr>`;
@@ -241,7 +241,7 @@ const views = {
     const events = await api("/v1/events?limit=200");
     const detail = (e) => {
       const d = e.detail ?? {};
-      if (e.action === "create") return `${d.instanceType ?? ""} ${d.diskGb ? d.diskGb + "GB" : ""} ${d.spot ? "spot" : ""} · ${d.repo ?? ""} @ ${d.branch ?? ""}`;
+      if (e.action === "create") return `${d.instanceType ?? ""} ${d.diskGb ? d.diskGb + "GB" : ""} ${d.spot ? "spot" : ""} · ${d.repo ?? ""} @ ${d.branch ?? ""}${d.profile ? ` (${d.profile})` : ""}`;
       if (e.action === "share") return `members: ${(d.members ?? []).join(", ") || "none"}`;
       if (e.action === "login") return `via ${d.via}${d.from ? " from " + d.from : ""}`;
       if (e.action.startsWith("token.")) return `"${d.name}" for ${d.user}`;

@@ -52,3 +52,30 @@ export function slugify(branch: string): string {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
 }
+
+/**
+ * A profile is a second axis of an env's identity: the same branch can be
+ * materialized more than once, one env per profile ("cloud" and
+ * "self-hosted" of the same pull request). It is part of the slug, so the
+ * env name, the VM name, the worktree, the ingress hostname and the tags all
+ * split by themselves. No profile keeps every identifier exactly as before.
+ */
+export function validateProfile(raw: string): string {
+  const p = raw.trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9-]{0,30}$/.test(p) || p.endsWith("-"))
+    throw new Error(
+      `Invalid profile "${raw}": use lowercase letters, digits and dashes (e.g. "cloud", "self-hosted")`,
+    );
+  return p;
+}
+
+/** RUNO_PROFILE, validated; `--profile` sets the same variable. */
+export function profileFromEnv(): string | undefined {
+  const raw = process.env.RUNO_PROFILE?.trim();
+  return raw ? validateProfile(raw) : undefined;
+}
+
+export function slugFor(branch: string, profile?: string): string {
+  const base = slugify(branch);
+  return profile ? `${base}-${profile}` : base;
+}

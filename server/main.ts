@@ -62,6 +62,8 @@ interface ServerEnv {
   owner: string;
   repo: string;
   branch: string;
+  /** second identity axis (--profile); absent for profile-less envs */
+  profile?: string;
   instanceId: string;
   instanceType: string;
   spot: boolean;
@@ -157,7 +159,10 @@ async function handleRpc(who: Identity, body: any): Promise<Response> {
   if (method === "create") {
     const pol = loadPolicies();
     const spec = args[0] as CreateSpec;
-    if (envsBefore.some(e => e.envName === spec.envName || (e.repo === spec.repo && e.branch === spec.branch)))
+    const sameEnv = (e: ServerEnv) =>
+      e.envName === spec.envName ||
+      (e.repo === spec.repo && e.branch === spec.branch && (e.profile ?? null) === (spec.profile ?? null));
+    if (envsBefore.some(sameEnv))
       throw new RunoError("Environment already exists; attach to it first");
     const userEnvCount = Object.values(loadEnvs()).filter((e) => e.owner === user).length;
     let runningTotal = 0;
@@ -188,7 +193,7 @@ async function handleRpc(who: Identity, body: any): Promise<Response> {
     store.openRun(rt.id, startedAt);
     store.addEvent({
       actor: user, action: "create", envName: spec.envName, instanceId: rt.id,
-      detail: { repo: spec.repo, branch: spec.branch, instanceType: rt.instanceType ?? spec.instanceType, diskGb: spec.diskGb, spot: Boolean(spec.spot) },
+      detail: { repo: spec.repo, branch: spec.branch, profile: spec.profile, instanceType: rt.instanceType ?? spec.instanceType, diskGb: spec.diskGb, spot: Boolean(spec.spot) },
     });
     const envs = loadEnvs();
     envs[spec.envName] = {
@@ -197,6 +202,7 @@ async function handleRpc(who: Identity, body: any): Promise<Response> {
       owner: user,
       repo: spec.repo,
       branch: spec.branch,
+      ...(spec.profile ? { profile: spec.profile } : {}),
       instanceId: rt.id,
       instanceType: rt.instanceType ?? spec.instanceType,
       spot: Boolean(spec.spot),

@@ -25,6 +25,7 @@ export interface SharedEnvironment {
   owner: string;
   repo: string;
   branch: string;
+  profile?: string;
   instanceId: string;
   createdAt: string;
   recipe?: string;
@@ -129,10 +130,23 @@ export class RemoteProvider implements RuntimeProvider {
     return data.result;
   }
 
-  async findByTags(repo: string, branch: string): Promise<Runtime | null> {
-    const matches = (await this.environments()).filter(e => e.repo === repo && e.branch === branch);
+  async findByTags(repo: string, branch: string, profile?: string): Promise<Runtime | null> {
+    const matches = (await this.environments()).filter(
+      (e) => e.repo === repo && e.branch === branch && (e.profile ?? undefined) === profile,
+    );
     if (matches.length > 1) throw new RunoError("Ambiguous environment; use runo attach <env-name>");
     return matches.length ? this.status({ id: matches[0].instanceId, ip: null, state: "unknown" }) : null;
+  }
+
+  async listByBranch(repo: string, branch: string): Promise<Runtime[]> {
+    const matches = (await this.environments()).filter((e) => e.repo === repo && e.branch === branch);
+    return Promise.all(
+      matches.map(async (e) => ({
+        ...(await this.status({ id: e.instanceId, ip: null, state: "unknown" })),
+        name: e.envName,
+        ...(e.profile ? { profile: e.profile } : {}),
+      })),
+    );
   }
 
   async share(id: string, members: string[]): Promise<void> {

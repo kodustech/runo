@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { AGENT_ENV_PATH, RUNO_HOME, REMOTE_RUNO_DIR, TMP_DIR, envNameFor, remoteRepoDir } from "./config";
+import { AGENT_ENV_PATH, RUNO_HOME, REMOTE_RUNO_DIR, TMP_DIR, envNameFor, profileFromEnv, remoteRepoDir, slugFor, validateProfile } from "./config";
 import { requireAgentEnv, resolveAgentEnv } from "./agentAuth";
 import { RunoError } from "./errors";
 import { fmtDuration, log } from "./log";
@@ -27,7 +27,6 @@ import { resumeEnv, upEnv } from "./engine/up";
 import { validateEnv } from "./engine/validate";
 import { ensureWorktree, removeWorktree } from "./engine/worktree";
 import { PUSH_EXCLUDES, pruneRemote } from "./engine/prune";
-import { slugify } from "./config";
 
 const USAGE = `runo — one remote environment per branch (AWS EC2)
 
@@ -41,6 +40,11 @@ Usage: runo <command> [args]
                               --here uses the CURRENT working tree as the sync
                               anchor (for Orca/worktree tools — runo won't
                               create nor ever remove it)
+  --profile <name>            (any command) one env PER PROFILE of a branch,
+                              e.g. cloud and self-hosted of the same PR. Picks
+                              .kodus/workspace.<name>.yaml when it exists;
+                              --recipe still wins. RUNO_PROFILE does the same.
+                              destroy --branch B without it takes every profile
   agent <claude|codex> [...]  agent session ON the VM (auth injected, cwd in repo)
   validate [step]             runs validate: on the VM, downloads JSON+MD evidence
   ship ["msg"] [--validate] [--destroy]
@@ -74,6 +78,7 @@ RUNO_HOME=${RUNO_HOME}`;
 
 interface Flags {
   branch?: string;
+  profile?: string;
   force: boolean;
   all: boolean;
   open: boolean;
@@ -117,6 +122,16 @@ function parseFlags(args: string[]): Flags {
       if (!rel) throw new RunoError("--recipe requires a path (e.g. .kodus/workspace.preview.yaml)");
       // read by loadRecipe wherever a context is built
       process.env.RUNO_RECIPE = rel;
+    } else if (a === "--profile") {
+      const raw = args[++i];
+      if (!raw) throw new RunoError("--profile requires a name (e.g. cloud, self-hosted)");
+      try {
+        f.profile = validateProfile(raw);
+      } catch (e: any) {
+        throw new RunoError(e.message);
+      }
+      // read by profileFromEnv / recipeCandidates wherever a context is built
+      process.env.RUNO_PROFILE = f.profile;
     } else if (a === "--force") f.force = true;
     else if (a === "--restart") f.restart = true;
     else if (a === "--rm") f.rm = true;
@@ -172,7 +187,9 @@ async function cmdAttach(flags: Flags): Promise<void> {
   const shared = (await provider.environments()).find(e => e.envName === name);
   if (!shared) throw new RunoError("Environment not found or not shared with you");
   const top = requireRepo();
-  const existing = registry.findByCwd(top);
+  // one checkout may attach to every profile of a branch, but not to two
+  // different environments of the same profile
+  const existing = registry.listByCwd(top).find((e) => (e.profile ?? null) === (shared.profile ?? null));
   if (existing && existing.name !== name)
     throw new RunoError("This checkout is already attached to another environment", "Use a separate checkout/worktree for QA");
   const recipe = process.env.RUNO_RECIPE || shared.recipe;
@@ -182,18 +199,18 @@ async function cmdAttach(flags: Flags): Promise<void> {
   const rt = await provider.status({ id: shared.instanceId, ip: null, state: "unknown" });
   registry.upsert({
     name: shared.envName, repo: shared.repo, repoPath: top, worktree: top,
-    branch: shared.branch, slug: shared.slug, externalWorktree: true,
+    branch: shared.branch, slug: shared.slug, profile: shared.profile, externalWorktree: true,
     provider: "remote", server: process.env.RUNO_SERVER!.replace(/\/+$/, ""),
     runtime: rt, state: rt.state === "running" ? "running" : "stopped",
     publicServices: shared.services ?? [], urls: shared.urls, recipe,
     createdAt: shared.createdAt, updatedAt: new Date().toISOString(),
   });
-  log.ok(`attached to ${shared.envName} (${shared.repo}@${shared.branch})`);
+  log.ok(`attached to ${shared.envName} (${shared.repo}@${shared.branch}${shared.profile ? `, profile ${shared.profile}` : ""})`);
   log.info("Use runo logs or runo exec -- <command> to investigate this environment");
 }
 
 async function cmdShare(flags: Flags): Promise<void> {
-  const env = resolveEnv({ branch: flags.branch });
+  const env = resolveEnv({ branch: flags.branch, profile: flags.profile });
   await remoteProvider().share((env.runtime as unknown as Runtime).id, flags.positional);
   log.ok(`collaborators: ${flags.positional.join(", ") || "none"}`);
 }
@@ -325,16 +342,18 @@ async function cmdNew(flags: Flags): Promise<void> {
   if (!name) throw new RunoError("Usage: runo new <name>", "E.g.: runo new checkout-fix");
   const repo = requireRepo();
   const branch = `task/${name}`;
-  const slug = slugify(branch);
+  const profile = flags.profile ?? profileFromEnv();
+  const slug = slugFor(branch, profile);
   const worktree = worktreePathFor(path.basename(repo), slug);
   log.step(`creating branch ${branch} + worktree ${worktree}`);
   ensureWorktree(repo, branch, worktree, { createBranch: true });
-  const ctx = buildContext(repo, branch);
+  const ctx = buildContext(repo, branch, profile);
   await upEnv(ctx);
   log.info(`local worktree: ${ctx.worktree}`);
 }
 
 async function cmdUp(flags: Flags): Promise<void> {
+  const profile = flags.profile ?? profileFromEnv();
   const byCwd = registry.findByCwd(process.cwd());
   let ctx: EnvContext;
   if (flags.here) {
@@ -343,18 +362,21 @@ async function cmdUp(flags: Flags): Promise<void> {
     // --branch is required on a detached HEAD, which is exactly what CI hands
     // us when it checks out a pull request by sha
     const branch = flags.branch ?? currentBranch(repo);
-    const existing = registry.findByRepoBranch(repo, branch);
-    ctx = existing ? contextFromEnv(existing) : buildContextHere(repo, branch);
-  } else if (byCwd && !flags.branch) {
+    // an external worktree may anchor one env per profile (CI brings a PR up
+    // as "cloud" AND "self-hosted" from the same checkout), so the profile is
+    // part of the lookup: without one, only the profile-less env matches
+    const existing = registry.listByRepoBranch(repo, branch).find((e) => e.profile === profile);
+    ctx = existing ? contextFromEnv(existing) : buildContextHere(repo, branch, profile);
+  } else if (byCwd && !flags.branch && (profile === undefined || byCwd.profile === profile)) {
     ctx = contextFromEnv(byCwd);
   } else {
     const repo = requireRepo();
     const branch = flags.branch ?? currentBranch(repo);
-    const existing = registry.findByRepoBranch(repo, branch);
+    const existing = registry.findByRepoBranch(repo, branch, profile);
     if (existing) ctx = contextFromEnv(existing);
     else {
-      ensureWorktree(repo, branch, worktreePathFor(path.basename(repo), slugify(branch)));
-      ctx = buildContext(repo, branch);
+      ensureWorktree(repo, branch, worktreePathFor(path.basename(repo), slugFor(branch, profile)));
+      ctx = buildContext(repo, branch, profile);
     }
   }
   await upEnv(ctx);
@@ -364,7 +386,7 @@ async function cmdAgent(flags: Flags): Promise<void> {
   const agent = flags.positional[0];
   if (agent !== "claude" && agent !== "codex")
     throw new RunoError("Usage: runo agent <claude|codex> [args...]");
-  const env = resolveEnv({ branch: flags.branch });
+  const env = resolveEnv({ branch: flags.branch, profile: flags.profile });
   const rt = await runningRuntime(env);
   const provider = getProvider(env.provider);
   const keys = requireAgentEnv(agent);
@@ -405,7 +427,7 @@ async function cmdAgent(flags: Flags): Promise<void> {
 }
 
 async function cmdValidate(flags: Flags): Promise<void> {
-  const env = resolveEnv({ branch: flags.branch });
+  const env = resolveEnv({ branch: flags.branch, profile: flags.profile });
   const ctx = contextFromEnv(env);
   const evidence = await validateEnv(ctx, flags.positional[0]);
   if (evidence.status !== "passed") {
@@ -416,7 +438,7 @@ async function cmdValidate(flags: Flags): Promise<void> {
 }
 
 async function cmdShip(flags: Flags): Promise<void> {
-  const env = resolveEnv({ branch: flags.branch });
+  const env = resolveEnv({ branch: flags.branch, profile: flags.profile });
   const message = flags.positional[0];
   const provider = getProvider(env.provider);
 
@@ -524,7 +546,7 @@ async function cmdShip(flags: Flags): Promise<void> {
 }
 
 async function cmdPull(flags: Flags): Promise<void> {
-  const env = resolveEnv({ branch: flags.branch });
+  const env = resolveEnv({ branch: flags.branch, profile: flags.profile });
   const rt = await runningRuntime(env);
   const provider = getProvider(env.provider);
   log.step(`rsync VM → worktree (${env.worktree})`);
@@ -542,7 +564,7 @@ async function cmdPull(flags: Flags): Promise<void> {
 }
 
 async function cmdPush(flags: Flags): Promise<void> {
-  const env = resolveEnv({ branch: flags.branch });
+  const env = resolveEnv({ branch: flags.branch, profile: flags.profile });
   const rt = await runningRuntime(env);
   const provider = getProvider(env.provider);
   log.step(`rsync worktree → VM (${remoteRepoDir(env.repo)})`);
@@ -568,7 +590,7 @@ async function cmdPush(flags: Flags): Promise<void> {
 }
 
 async function cmdTunnel(flags: Flags): Promise<void> {
-  const env = resolveEnv({ branch: flags.branch });
+  const env = resolveEnv({ branch: flags.branch, profile: flags.profile });
   const rt = await runningRuntime(env);
   const provider = getProvider(env.provider);
   if (!provider.tunnel)
@@ -592,7 +614,7 @@ async function cmdTunnel(flags: Flags): Promise<void> {
 }
 
 async function cmdUrl(flags: Flags): Promise<void> {
-  const env = resolveEnv({ branch: flags.branch });
+  const env = resolveEnv({ branch: flags.branch, profile: flags.profile });
   const provider = getProvider(env.provider);
   const rt = await provider.status(env.runtime as unknown as Runtime);
   if (!rt.ip)
@@ -606,7 +628,7 @@ async function cmdUrl(flags: Flags): Promise<void> {
 }
 
 async function cmdLogs(flags: Flags): Promise<void> {
-  const env = resolveEnv({ branch: flags.branch });
+  const env = resolveEnv({ branch: flags.branch, profile: flags.profile });
   const ctx = contextFromEnv(env);
   const rt = await runningRuntime(env);
   const provider = getProvider(env.provider);
@@ -640,7 +662,7 @@ async function cmdLogs(flags: Flags): Promise<void> {
 async function cmdExec(flags: Flags): Promise<void> {
   if (flags.passthrough.length === 0)
     throw new RunoError("Usage: runo exec -- <command...>", "E.g.: runo exec -- docker ps");
-  const env = resolveEnv({ branch: flags.branch });
+  const env = resolveEnv({ branch: flags.branch, profile: flags.profile });
   const rt = await runningRuntime(env);
   const provider = getProvider(env.provider);
   const code = await provider.execInteractive(rt, flags.passthrough.join(" "), {
@@ -662,7 +684,7 @@ async function cmdLs(): Promise<void> {
     return;
   }
   const provider = getProvider("aws");
-  const rows: string[][] = [["ENV", "BRANCH", "STATE", "URL", "UPTIME", "INSTANCE"]];
+  const rows: string[][] = [["ENV", "BRANCH", "PROFILE", "STATE", "URL", "UPTIME", "INSTANCE"]];
   const statuses = await Promise.all(
     envs.map(async (e) => {
       if (!(e.runtime as any)?.id) return { e, rt: null as Runtime | null };
@@ -684,6 +706,7 @@ async function cmdLs(): Promise<void> {
     rows.push([
       e.name,
       e.branch,
+      e.profile ?? "-",
       rt?.state ?? e.state,
       url,
       rt?.state === "running" ? fmtUptime(rt.launchedAt) : "-",
@@ -695,7 +718,7 @@ async function cmdLs(): Promise<void> {
 }
 
 async function cmdSuspend(flags: Flags): Promise<void> {
-  const env = resolveEnv({ branch: flags.branch });
+  const env = resolveEnv({ branch: flags.branch, profile: flags.profile });
   const provider = getProvider(env.provider);
   log.step(`stopping instance for ${env.name} (stopped = EBS-only cost)…`);
   const rt = await provider.suspend(env.runtime as unknown as Runtime);
@@ -704,7 +727,7 @@ async function cmdSuspend(flags: Flags): Promise<void> {
 }
 
 async function cmdResume(flags: Flags): Promise<void> {
-  const env = resolveEnv({ branch: flags.branch });
+  const env = resolveEnv({ branch: flags.branch, profile: flags.profile });
   await resumeEnv(contextFromEnv(env));
 }
 
@@ -843,9 +866,21 @@ async function cmdDestroy(flags: Flags): Promise<void> {
   // Tearing down something that is already gone is the goal, not an error:
   // CI calls this on every closed PR, including ones that never got an env.
   // Anything else — a broken key, a throttled API — must still fail loudly.
-  const env = flags.branch ? await resolveOrAdopt(flags.branch) : resolveEnv({});
+  // `--branch` without `--profile` means the whole branch: a closed PR takes
+  // every profile it had with it.
+  const profile = flags.profile ?? profileFromEnv();
+  if (flags.branch && profile === undefined) {
+    const envs = await resolveOrAdoptAll(flags.branch);
+    if (envs.length === 0) {
+      log.ok(`no environment for ${flags.branch} — nothing to destroy`);
+      return;
+    }
+    for (const env of envs) await destroyOne(env);
+    return;
+  }
+  const env = flags.branch ? await resolveOrAdopt(flags.branch, profile) : resolveEnv({ profile });
   if (!env) {
-    log.ok(`no environment for ${flags.branch} — nothing to destroy`);
+    log.ok(`no environment for ${flags.branch}${profile ? ` (${profile})` : ""} — nothing to destroy`);
     return;
   }
   await destroyOne(env);
@@ -856,24 +891,46 @@ async function cmdDestroy(flags: Flags): Promise<void> {
  * preview down from a fresh runner whose registry is empty. Fall back to the
  * instance's own tags before giving up.
  */
-async function resolveOrAdopt(branch: string): Promise<EnvRecord | null> {
+async function resolveOrAdopt(branch: string, profile?: string): Promise<EnvRecord | null> {
   try {
-    return resolveEnv({ branch });
+    return resolveEnv({ branch, profile });
   } catch (notRegistered) {
     const repoPath = requireRepo();
     const repoName = path.basename(repoPath);
     const provider = getProvider("aws");
     await provider.preflight();
-    const rt = await provider.findByTags?.(repoName, branch);
+    const rt = await provider.findByTags?.(repoName, branch, profile);
     if (!rt) return null;
-    const slug = slugify(branch);
-    log.step(`no local record for ${branch} — adopting ${rt.id} by tag`);
-    return {
+    return adoptedRecord(repoPath, branch, rt, profile);
+  }
+}
+
+/** Every env of the branch (all profiles): local records first, then tags. */
+async function resolveOrAdoptAll(branch: string): Promise<EnvRecord[]> {
+  const repoPath = requireRepo();
+  const repoName = path.basename(repoPath);
+  const local = registry.listByRepoBranch(repoPath, branch);
+  const provider = getProvider("aws");
+  await provider.preflight();
+  const remote = (await provider.listByBranch?.(repoName, branch)) ?? [];
+  const known = new Set(local.map((e) => (e.runtime as any)?.id).filter(Boolean));
+  const adopted = remote
+    .filter((rt) => !known.has(rt.id))
+    .map((rt) => adoptedRecord(repoPath, branch, rt, typeof rt.profile === "string" ? rt.profile : undefined));
+  return [...local, ...adopted];
+}
+
+function adoptedRecord(repoPath: string, branch: string, rt: Runtime, profile?: string): EnvRecord {
+  const repoName = path.basename(repoPath);
+  const slug = slugFor(branch, profile);
+  log.step(`no local record for ${branch}${profile ? ` (${profile})` : ""} — adopting ${rt.id} by tag`);
+  return {
       name: rt.name ?? envNameFor(slug),
       repo: repoName,
       repoPath,
       branch,
       slug,
+      profile,
       worktree: repoPath,
       externalWorktree: true, // never touch a directory this machine did not create
       provider: "aws",
@@ -883,7 +940,6 @@ async function resolveOrAdopt(branch: string): Promise<EnvRecord | null> {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
-  }
 }
 
 // ---------------- dispatch ----------------
