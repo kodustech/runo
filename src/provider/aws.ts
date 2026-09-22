@@ -461,7 +461,20 @@ export class Ec2Provider implements RuntimeProvider {
       repo: spec.repo,
     });
     log.dim(`instance ${id} created (${spec.instanceType}, ${spec.diskGb}GB gp3, ${AWS_REGION})`);
-    return await this.waitForState(id, "running", 5 * 60_000, true);
+    try {
+      return await this.waitForState(id, "running", 5 * 60_000, true);
+    } catch (e) {
+      // The caller never learns this id when create fails, so nothing would
+      // ever terminate it: an instance that did not come up must not outlive
+      // the error that reported it.
+      log.warn(`instance ${id} did not come up — terminating it so it cannot leak`);
+      try {
+        await this.ec2.send(new TerminateInstancesCommand({ InstanceIds: [id] }));
+      } catch (cleanup: any) {
+        log.warn(`could not terminate ${id}: ${cleanup?.message ?? cleanup} — terminate it by hand`);
+      }
+      throw e;
+    }
   }
 
   private mapInstance(i: Instance | undefined, id: string): Runtime {
@@ -488,10 +501,18 @@ export class Ec2Provider implements RuntimeProvider {
       const res = await this.ec2.send(new DescribeInstancesCommand({ InstanceIds: [id] }));
       return this.mapInstance(res.Reservations?.[0]?.Instances?.[0], id);
     } catch (e: any) {
-      if (errCode(e) === "InvalidInstanceID.NotFound") return { id, ip: null, state: "terminated" };
+      // Gone for good — or not born yet: DescribeInstances is eventually
+      // consistent and can answer NotFound for a few seconds after
+      // RunInstances. Callers that just launched the instance check the flag.
+      if (errCode(e) === "InvalidInstanceID.NotFound") return { id, ip: null, state: "terminated", notFound: true };
       throw e;
     }
   }
+
+  /** Poll interval of waitForState; a test shortens it. */
+  private pollMs = 5000;
+  /** How long a just-launched instance may answer NotFound before it counts as gone. */
+  private static readonly NOT_FOUND_GRACE_MS = 90_000;
 
   private async waitForState(
     id: string,
@@ -499,14 +520,24 @@ export class Ec2Provider implements RuntimeProvider {
     timeoutMs: number,
     requireIp = false,
   ): Promise<Runtime> {
-    const deadline = Date.now() + timeoutMs;
+    const started = Date.now();
+    const deadline = started + timeoutMs;
     let last: Runtime = { id, ip: null, state: "unknown" };
+    let seen = false; // described at least once — NotFound after that is a real termination
     while (Date.now() < deadline) {
       last = await this.describe(id);
+      if (last.notFound && !seen && Date.now() - started < Ec2Provider.NOT_FOUND_GRACE_MS) {
+        // RunInstances returned this id seconds ago; DescribeInstances has
+        // not caught up yet. Treating that as "terminated" leaks a running
+        // VM nobody has a record of.
+        await sleep(this.pollMs);
+        continue;
+      }
+      seen = seen || !last.notFound;
       if (last.state === want && (!requireIp || last.ip)) return last;
       if (want !== "terminated" && (last.state === "terminated" || last.state === "shutting-down"))
         throw new RunoError(`Instance ${id} terminated unexpectedly (state: ${last.state})`);
-      await sleep(5000);
+      await sleep(this.pollMs);
     }
     throw new RunoError(
       `Timed out waiting for instance ${id} to reach "${want}" (last state: ${last.state})`,
