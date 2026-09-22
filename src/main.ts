@@ -187,7 +187,9 @@ async function cmdAttach(flags: Flags): Promise<void> {
   const shared = (await provider.environments()).find(e => e.envName === name);
   if (!shared) throw new RunoError("Environment not found or not shared with you");
   const top = requireRepo();
-  const existing = registry.findByCwd(top);
+  // one checkout may attach to every profile of a branch, but not to two
+  // different environments of the same profile
+  const existing = registry.listByCwd(top).find((e) => (e.profile ?? null) === (shared.profile ?? null));
   if (existing && existing.name !== name)
     throw new RunoError("This checkout is already attached to another environment", "Use a separate checkout/worktree for QA");
   const recipe = process.env.RUNO_RECIPE || shared.recipe;

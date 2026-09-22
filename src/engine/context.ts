@@ -2,7 +2,7 @@ import path from "node:path";
 import { WORKTREES_DIR, envNameFor, profileFromEnv, slugFor } from "../config";
 import { RunoError } from "../errors";
 import { loadRecipe, loadRecipeFrom, type NormalizedRecipe } from "../recipe";
-import { registry, type EnvRecord } from "../registry";
+import { AmbiguousEnvError, registry, type EnvRecord } from "../registry";
 
 export function git(cwd: string, ...args: string[]): { exitCode: number; stdout: string; stderr: string } {
   const proc = Bun.spawnSync(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe" });
@@ -105,12 +105,18 @@ export function contextFromEnv(env: EnvRecord): EnvContext {
 export function resolveEnv(opts: { branch?: string; profile?: string } = {}): EnvRecord {
   const cwd = process.cwd();
   const profile = opts.profile ?? profileFromEnv();
-  const byWorktree = registry.findByCwd(cwd);
+  // A runo-created worktree is one env; an external one (--here, attach) may
+  // anchor one env per profile, so the profile has to pick when there are two.
+  const anchored = registry.listByCwd(cwd);
+  const byWorktree =
+    profile !== undefined
+      ? anchored.find((e) => e.profile === profile)
+      : anchored.length > 1 && !opts.branch
+        ? (() => { throw new AmbiguousEnvError(anchored[0]!.branch, anchored.map((e) => e.profile ?? "(none)")); })()
+        : anchored[0];
   if (byWorktree?.server && byWorktree.server !== process.env.RUNO_SERVER?.replace(/\/+$/, ""))
     throw new RunoError(`This checkout is attached to ${byWorktree.server}; set RUNO_SERVER accordingly`);
-  // A runo-created worktree is one env; an external one (--here, attach) may
-  // anchor one env per profile, so only trust it when the profile agrees.
-  if (byWorktree && !opts.branch && (profile === undefined || byWorktree.profile === profile)) return byWorktree;
+  if (byWorktree && !opts.branch) return byWorktree;
 
   const top = repoTop(cwd);
   if (top) {

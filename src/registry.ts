@@ -107,9 +107,15 @@ export const registry = {
     throw new AmbiguousEnvError(branch, all.map((e) => e.profile ?? "(none)"));
   },
 
-  findByCwd(cwd: string): EnvRecord | undefined {
+  /** Every env anchored at cwd — an external worktree (--here, attach) may
+   * anchor one per profile. */
+  listByCwd(cwd: string): EnvRecord[] {
     const abs = path.resolve(cwd);
-    return this.list().find((e) => abs === e.worktree || abs.startsWith(e.worktree + path.sep));
+    return this.list().filter((e) => abs === e.worktree || abs.startsWith(e.worktree + path.sep));
+  },
+
+  findByCwd(cwd: string): EnvRecord | undefined {
+    return this.listByCwd(cwd)[0];
   },
 
   upsert(env: EnvRecord): EnvRecord {
