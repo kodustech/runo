@@ -288,7 +288,7 @@ const views = {
       <form class="settings card" data-form="policies">
         <label>Allowed instance types (comma separated; empty = any)<input name="allowed_instance_types" value="${val(policies.allowed_instance_types?.join(", "))}" /></label>
         <label>Max disk per environment, GB<input name="max_disk_gb" type="number" min="1" value="${val(policies.max_disk_gb)}" /></label>
-        <label>Max environments per person<input name="max_envs_per_user" type="number" min="1" value="${val(policies.max_envs_per_user)}" /></label>
+        <label>Max environments running per person<input name="max_envs_per_user" type="number" min="1" value="${val(policies.max_envs_per_user)}" /></label>
         <label>Max machines running at once, whole org<input name="max_running_total" type="number" min="1" value="${val(policies.max_running_total)}" /></label>
         <label>Ports anyone may open to the world (comma separated; empty = 80, 443; other ports need an admin)<input name="allowed_public_ports" value="${val(policies.allowed_public_ports?.join(", "))}" /></label>
         <label>Destroy environments older than, days (fractions allowed)<input name="env_ttl_days" type="number" min="0" step="any" value="${val(policies.env_ttl_days)}" /></label>

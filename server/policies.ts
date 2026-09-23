@@ -18,7 +18,7 @@ export interface Policies {
   allowed_instance_types?: string[];
   /** Maximum root disk size a recipe may request. */
   max_disk_gb?: number;
-  /** Maximum environments a single user may own at once. */
+  /** Maximum RUNNING/pending environments a single user may have at once. */
   max_envs_per_user?: number;
   /** Org-wide ceiling of RUNNING/pending instances. */
   max_running_total?: number;
@@ -90,7 +90,7 @@ export function savePolicies(pol: Policies): void {
 export function enforceCreate(
   pol: Policies,
   spec: CreateSpec,
-  ctx: { user: string; userEnvCount: number; runningTotal: number },
+  ctx: { user: string; userRunningCount: number; runningTotal: number },
 ): void {
   if (pol.allowed_instance_types && !pol.allowed_instance_types.includes(spec.instanceType))
     throw new RunoError(
@@ -102,10 +102,10 @@ export function enforceCreate(
       `Policy: disk ${spec.diskGb}GB exceeds the organization limit (${pol.max_disk_gb}GB)`,
       "Lower limits.disk in the repo's recipe or talk to the platform team.",
     );
-  if (pol.max_envs_per_user !== undefined && ctx.userEnvCount >= pol.max_envs_per_user)
+  if (pol.max_envs_per_user !== undefined && ctx.userRunningCount >= pol.max_envs_per_user)
     throw new RunoError(
-      `Policy: you already own ${ctx.userEnvCount} environment(s) (limit ${pol.max_envs_per_user})`,
-      "Destroy one you no longer need (`runo ls`, `runo destroy`) and try again.",
+      `Policy: you already have ${ctx.userRunningCount} environment(s) running (limit ${pol.max_envs_per_user})`,
+      "Suspend or destroy one you no longer need (`runo ls`, `runo suspend`, `runo destroy`) and try again.",
     );
   if (pol.max_running_total !== undefined && ctx.runningTotal >= pol.max_running_total)
     throw new RunoError(

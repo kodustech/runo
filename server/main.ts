@@ -29,7 +29,7 @@ import { AccessDenied, canAccess, requireAccess } from "./access";
 import { Auth, authConfigFromEnv, ReauthRequired, readCookie, safeEqual, sessionMayCall, SESSION_RPC, Throttle, type Identity } from "./auth";
 import { handlePanelApi } from "./panelApi";
 import { Store } from "./store";
-import { sampleFleet } from "./usage";
+import { isUp, sampleFleet, vanishedEnvs } from "./usage";
 import { randomBytes } from "node:crypto";
 
 const PORT = Number(process.env.RUNO_SERVER_PORT || argValue("--port") || 7777);
@@ -164,13 +164,15 @@ async function handleRpc(who: Identity, body: any): Promise<Response> {
       (e.repo === spec.repo && e.branch === spec.branch && (e.profile ?? null) === (spec.profile ?? null));
     if (envsBefore.some(sameEnv))
       throw new RunoError("Environment already exists; attach to it first");
-    const userEnvCount = Object.values(loadEnvs()).filter((e) => e.owner === user).length;
-    let runningTotal = 0;
-    if (pol.max_running_total !== undefined)
-      runningTotal = (await provider.listManaged()).filter(
-        (m) => m.state === "running" || m.state === "pending",
-      ).length;
-    enforceCreate(pol, spec, { user, userEnvCount, runningTotal });
+    // Both limits count live instances: a stopped env costs only EBS, and a
+    // record whose VM is gone must not hold a slot.
+    let up = new Set<string>();
+    if (pol.max_envs_per_user !== undefined || pol.max_running_total !== undefined)
+      up = new Set((await provider.listManaged()).filter((m) => isUp(m.state)).map((m) => m.id));
+    const userRunningCount = Object.values(loadEnvs()).filter(
+      (e) => e.owner === user && up.has(e.instanceId),
+    ).length;
+    enforceCreate(pol, spec, { user, userRunningCount, runningTotal: up.size });
   }
 
   const startedAt = Date.now();
@@ -466,10 +468,22 @@ async function sampleNow(): Promise<void> {
   if (sampling) return;
   sampling = true;
   try {
-    await sampleFleet(store, await provider.listManaged(), Object.values(loadEnvs()), async (id) => {
+    const managed = await provider.listManaged();
+    const confirmGone = async (id: string) => {
       const rt = await provider.status({ id, ip: null, state: "unknown" });
       return rt.state === "terminated" || rt.state === "shutting-down";
-    });
+    };
+    await sampleFleet(store, managed, Object.values(loadEnvs()), confirmGone);
+    const gone = await vanishedEnvs(managed, Object.values(loadEnvs()), confirmGone);
+    if (gone.length) {
+      const envs = loadEnvs();
+      for (const e of gone) {
+        if (envs[e.envName]?.instanceId !== e.instanceId) continue; // re-created meanwhile
+        delete envs[e.envName];
+        log.warn(`[${e.owner}] ${e.envName} (${e.instanceId}) is gone; dropped from the registry`);
+      }
+      saveEnvs(envs);
+    }
   } catch (e: any) {
     log.warn(`fleet sample failed: ${e?.message ?? e}`);
   } finally {
