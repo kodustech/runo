@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { parse } from "yaml";
 import {
@@ -79,4 +80,40 @@ test("tolerates a failed probe without throwing", async () => {
   const { provider, commands } = fakeProvider("", 1);
   await ensureIdleWatchdog(provider, rt);
   expect(commands.length).toBe(1); // no writes attempted
+});
+
+// Runs the real script against a fake /etc/runo and /run by rewriting its paths.
+test("idle-signals without net: traffic no longer keeps the VM awake", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "runo-idle-"));
+  try {
+    mkdirSync(path.join(root, "etc"));
+    mkdirSync(path.join(root, "state"));
+    mkdirSync(path.join(root, "bin"));
+    writeFileSync(path.join(root, "etc/idle-limit"), "60\n");
+    writeFileSync(path.join(root, "state/last-active"), String(Math.floor(Date.now() / 1000) - 3600));
+    // stubs: an ssh-less box with heavy traffic; poweroff only leaves a mark
+    writeFileSync(path.join(root, "bin/ss"), "#!/bin/sh\n", { mode: 0o755 });
+    writeFileSync(path.join(root, "bin/ip"), "#!/bin/sh\necho 'default via 10.0.0.1 dev eth0'\n", { mode: 0o755 });
+    writeFileSync(path.join(root, "bin/logger"), "#!/bin/sh\n", { mode: 0o755 });
+    writeFileSync(path.join(root, "bin/pgrep"), "#!/bin/sh\n", { mode: 0o755 });
+    writeFileSync(path.join(root, "bin/systemctl"), `#!/bin/sh\ntouch ${root}/powered-off\n`, { mode: 0o755 });
+    let rx = 0;
+    const netdev = path.join(root, "netdev");
+    const script = IDLE_CHECK_SCRIPT.replaceAll("/etc/runo", path.join(root, "etc"))
+      .replaceAll("/run/runo-idle", path.join(root, "state"))
+      .replaceAll("/proc/net/dev", netdev);
+    const run = () => {
+      rx += 50_000_000; // 50MB since the last minute
+      writeFileSync(netdev, `h1\nh2\n  eth0: ${rx} 0 0 0 0 0 0 0 1000 0 0 0 0 0 0 0\n`);
+      Bun.spawnSync(["bash", "-c", script], { env: { PATH: `${root}/bin:${process.env.PATH}` } });
+      return existsSync(path.join(root, "powered-off"));
+    };
+    run(); // first sample only records the byte counter
+    expect(run()).toBe(false); // default signals: traffic is activity
+    writeFileSync(path.join(root, "etc/idle-signals"), "ssh agent\n");
+    writeFileSync(path.join(root, "state/last-active"), String(Math.floor(Date.now() / 1000) - 3600));
+    expect(run()).toBe(true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

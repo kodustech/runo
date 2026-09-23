@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { loadRecipe, recipeCandidates } from "./recipe";
+import { loadRecipe, parseRecipe, recipeCandidates } from "./recipe";
 
 const saved = { RUNO_RECIPE: process.env.RUNO_RECIPE, RUNO_PROFILE: process.env.RUNO_PROFILE };
 afterEach(() => {
@@ -35,4 +35,13 @@ test("a profile without its own recipe file falls back to the default recipe", (
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("limits.idle_activity: every signal by default, a subset when listed, typos rejected", () => {
+  const recipe = (limits: string) =>
+    parseRecipe(`version: 1\nservices:\n  api:\n    run: bun app.ts\n    port: 3000\nlimits:\n${limits}`, "test");
+  expect(recipe("  idle_suspend: 2h\n").limits.idleActivity).toEqual(["ssh", "net", "agent"]);
+  expect(recipe("  idle_activity: [ssh, agent]\n").limits.idleActivity).toEqual(["ssh", "agent"]);
+  expect(recipe("  idle_activity: []\n").limits.idleActivity).toEqual([]);
+  expect(() => recipe("  idle_activity: [ssh, http]\n")).toThrow('limits.idle_activity "http"');
 });
