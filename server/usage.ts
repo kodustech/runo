@@ -121,7 +121,25 @@ export interface RegisteredEnv {
   createdAt?: string;
 }
 
-const isUp = (state: string) => state === "running" || state === "pending";
+export const isUp = (state: string) => state === "running" || state === "pending";
+
+/**
+ * Registered envs whose instance no longer exists: missing from `managed` and
+ * confirmed gone by the provider (a partial listing must not drop records).
+ * Spot interruptions and console terminations never go through `destroy`, so
+ * without this their records would count against the owner forever.
+ */
+export async function vanishedEnvs(
+  managed: Runtime[],
+  registered: RegisteredEnv[],
+  confirmGone: (instanceId: string) => Promise<boolean>,
+): Promise<RegisteredEnv[]> {
+  const live = new Set(managed.map((rt) => rt.id));
+  const gone: RegisteredEnv[] = [];
+  for (const e of registered)
+    if (!live.has(e.instanceId) && (await confirmGone(e.instanceId))) gone.push(e);
+  return gone;
+}
 
 /**
  * One observation of the fleet. `managed` is what the cloud says is alive;

@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
 import { defaultPricing, parsePricing } from "./pricing";
-import { parsePolicies } from "./policies";
+import { enforceCreate, parsePolicies } from "./policies";
 import { Store } from "./store";
-import { breakdown, machineUsage, sampleFleet, usageBetween } from "./usage";
+import { breakdown, machineUsage, sampleFleet, usageBetween, vanishedEnvs } from "./usage";
 
 const HOUR = 3_600_000;
 const pricing = { instance_hourly: { "t3.xlarge": 0.2 }, spot_factor: 0.5, ebs_gb_month: 0.1, ebs_extra_month: 0, ipv4_hourly: 0 };
@@ -81,4 +81,25 @@ test("panel input is validated before it reaches policies.yaml or the price tabl
   expect(parsePricing(defaultPricing("us-east-2")).instance_hourly["t3.xlarge"]).toBe(0.1664);
   expect(() => parsePricing({ ...defaultPricing("us-east-2"), spot_factor: 2 })).toThrow();
   expect(() => parsePricing({ ...defaultPricing("us-east-2"), instance_hourly: { "t3.large": "free" } })).toThrow();
+});
+
+test("vanished envs: only records whose instance the provider confirms gone", async () => {
+  const env = (id: string) => ({ envName: `env-${id}`, owner: "ci", instanceId: id });
+  const registered = [env("i-up"), env("i-stopped"), env("i-gone"), env("i-unlisted")];
+  const managed = [
+    { id: "i-up", ip: null, state: "running" as const },
+    { id: "i-stopped", ip: null, state: "stopped" as const },
+  ];
+  // i-unlisted is missing from a partial listing but the cloud still knows it
+  const gone = await vanishedEnvs(managed, registered, async (id) => id === "i-gone");
+  expect(gone.map((e) => e.instanceId)).toEqual(["i-gone"]);
+});
+
+test("max_envs_per_user counts running environments, not records", () => {
+  const spec = { envName: "e", instanceType: "t3.xlarge", diskGb: 50 } as any;
+  const pol = { max_envs_per_user: 5 };
+  expect(() => enforceCreate(pol, spec, { user: "ci", userRunningCount: 4, runningTotal: 4 })).not.toThrow();
+  expect(() => enforceCreate(pol, spec, { user: "ci", userRunningCount: 5, runningTotal: 5 })).toThrow(
+    "you already have 5 environment(s) running (limit 5)",
+  );
 });

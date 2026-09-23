@@ -11,7 +11,7 @@ allowed_instance_types: [t3.medium, t3.large, t3.xlarge, t3a.xlarge]
 # Maximum root disk a recipe may request:
 max_disk_gb: 150
 
-# Maximum environments a single user may own at once:
+# Maximum RUNNING environments a single user may have at once (stopped ones cost only EBS):
 max_envs_per_user: 3
 
 # Org-wide ceiling of RUNNING instances (stopped ones cost only EBS):
