@@ -10,7 +10,7 @@ import { shq } from "../ssh";
 import { git, type EnvContext } from "./context";
 import { getExpose } from "../expose";
 import { composePrefix, healthcheckPublic, planServices, probeServices, startServices, waitInternalPorts } from "./services";
-import { ensureIdleWatchdog } from "./idleWatchdog";
+import { IDLE_MARK_ACTIVE, ensureIdleWatchdog } from "./idleWatchdog";
 
 /** Tooling that cloud-init must have left ready on the VM. */
 const TOOLING_CHECK =
@@ -214,11 +214,22 @@ async function finishUp(
   }
   await healthcheckPublic(provider, rt, ctx.recipe, remoteDir, plan.publicServices, urls);
 
-  // idle auto-suspend (the on-VM watchdog reads /etc/runo/idle-limit)
-  const idle = ctx.recipe.limits.idleSuspendSec;
-  await provider.exec(rt, `sudo mkdir -p /etc/runo && echo ${idle} | sudo tee /etc/runo/idle-limit >/dev/null`);
-  if (idle > 0)
-    log.dim(`auto-suspend: the VM suspends itself after ${Math.round(idle / 60)}min of inactivity (limits.idle_suspend)`);
+  // idle auto-suspend (the on-VM watchdog reads /etc/runo/idle-limit and
+  // idle-signals); an up is activity too, so the idle clock restarts here
+  const { idleSuspendSec: idle, idleActivity } = ctx.recipe.limits;
+  await provider.exec(
+    rt,
+    [
+      "sudo mkdir -p /etc/runo",
+      `echo ${idle} | sudo tee /etc/runo/idle-limit >/dev/null`,
+      `echo ${shq(idleActivity.join(" "))} | sudo tee /etc/runo/idle-signals >/dev/null`,
+      IDLE_MARK_ACTIVE,
+    ].join(" && "),
+  );
+  if (idle > 0) {
+    const counts = idleActivity.length ? `without ${idleActivity.join("/")} activity` : "after this up, whatever happens";
+    log.dim(`auto-suspend: the VM suspends itself ${Math.round(idle / 60)}min ${counts} (limits.idle_suspend)`);
+  }
   // the watchdog itself (script + cron) must exist too — baked/pool/old VMs
   // can miss the cloud-init install and would then stay up forever
   await ensureIdleWatchdog(provider, rt);
@@ -337,6 +348,9 @@ export async function upEnv(ctx: EnvContext): Promise<EnvRecord> {
 
   if (rt.state === "pending") rt = await provider.resume(rt); // waits for running
 
+  // a long reconcile must not race the watchdog of a VM that sat idle
+  await provider.exec(rt, IDLE_MARK_ACTIVE);
+
   // reconcile only applies if materialization completed AND the repo still exists on the VM
   const remoteDir = remoteRepoDir(ctx.repoName);
   const repoExists =
@@ -387,6 +401,7 @@ export async function resumeEnv(ctx: EnvContext): Promise<EnvRecord> {
   }
   registry.upsert({ ...env, runtime: rt as unknown as Record<string, unknown>, state: "running" });
   await provider.waitReady(rt);
+  await provider.exec(rt, IDLE_MARK_ACTIVE);
 
   // hot return from hibernation? services already answering = restart nothing
   if (await probeServices(rt, env.publicServices, env.urls ?? {})) {

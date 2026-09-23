@@ -142,6 +142,8 @@ limits:
   instance: t3.medium
   disk: 30gb
   idle_suspend: 10m         # default 10m; "2h" or "off" — idle auto-suspend
+  idle_activity: [ssh, net, agent]  # default all; what counts as use. A public
+                            # preview drops net: the clock then runs from the last up
   spot: true                # ~70% cheaper; AWS interruption = stop (EBS survives,
                             # runo resume restarts). Automatic on-demand fallback.
                             # Spot skips the warm pool and hibernation.
@@ -296,9 +298,12 @@ runo up --here
 - **Idle auto-suspend** (`limits.idle_suspend`, default 10m): a watchdog ON the
   VM (1/min cron) shuts the instance down after N minutes without activity —
   internal shutdown becomes "stopped" (= suspend). Activity = established SSH
-  session, load ≥ 0.20, network traffic (>100KB/min — includes someone using
-  the public URL) or CPU from claude/codex processes (a detached agent that is
-  working counts as active; an agent idle at the prompt does not).
+  session, network traffic (>100KB/min — includes someone using the public
+  URL) or CPU from claude/codex processes (a detached agent that is working
+  counts as active; an agent idle at the prompt does not). Every `runo up` and
+  resume restarts the clock. `limits.idle_activity` narrows the signals: a
+  public URL draws bot and outbound traffic that never lets a VM look idle, so
+  a PR preview uses `[ssh, agent]` and suspends N after its last deploy.
 - **Baked image** (`runo bake`): a temporary VM runs full cloud-init,
   `cloud-init clean`, stop, `CreateImage`. `runo up` then uses that AMI (no
   heavy user-data) and cold boot drops from ~6min to ~1-2min. Idle cost: just

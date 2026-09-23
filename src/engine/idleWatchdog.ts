@@ -23,10 +23,13 @@ set -u
 LIMIT=$(cat /etc/runo/idle-limit 2>/dev/null || echo 600)
 case "$LIMIT" in (*[!0-9]*|"") exit 0;; esac
 [ "$LIMIT" -le 0 ] && exit 0
+# which activity counts (idle-signals, default all): a public preview gets
+# enough bot and outbound traffic to never look idle, so it drops "net"
+SIGNALS=" $(cat /etc/runo/idle-signals 2>/dev/null || echo ssh net agent) "
 STATE=/run/runo-idle; mkdir -p "$STATE"
 now=$(date +%s); active=""
-ss -Htn state established '( sport = :22 )' 2>/dev/null | grep -q . && active=ssh
-if [ -z "$active" ]; then
+[[ $SIGNALS == *" ssh "* ]] && ss -Htn state established '( sport = :22 )' 2>/dev/null | grep -q . && active=ssh
+if [ -z "$active" ] && [[ $SIGNALS == *" net "* ]]; then
   # default-route interface only: container-to-container chatter and
   # watch-mode rebuild loops must not count as user activity
   IFACE=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
@@ -37,7 +40,7 @@ if [ -z "$active" ]; then
     [ $(( \${bytes:-0} - prev )) -gt 102400 ] && active=net
   fi
 fi
-if [ -z "$active" ]; then
+if [ -z "$active" ] && [[ $SIGNALS == *" agent "* ]]; then
   for pid in $(pgrep -x claude; pgrep -x codex); do
     t=$(awk '{ print $14+$15 }' "/proc/$pid/stat" 2>/dev/null) || continue
     prev=$(cat "$STATE/agent-$pid" 2>/dev/null || echo -1)
@@ -54,6 +57,13 @@ if [ $((now - last)) -ge "$LIMIT" ]; then
   systemctl poweroff
 fi
 `;
+
+/**
+ * Restarts the idle clock. Every up/resume is use, and a VM resumed from
+ * hibernation comes back with the old clock in /run: without this, one whose
+ * signals exclude "net" would power off again within a minute.
+ */
+export const IDLE_MARK_ACTIVE = "sudo mkdir -p /run/runo-idle && date +%s | sudo tee /run/runo-idle/last-active >/dev/null";
 
 export const IDLE_CRON_CONTENT = `* * * * * root /usr/local/bin/runo-idle-check
 `;

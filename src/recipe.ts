@@ -55,10 +55,20 @@ export interface NormalizedRecipe {
   data: { migrate?: string; seed?: string };
   validate: { name: string; run: string }[];
   expose: ExposeDef;
-  limits: { instance: string; diskGb: number; idleSuspendSec: number; spot: boolean }; // idle 0 = auto-suspend off
+  limits: {
+    instance: string;
+    diskGb: number;
+    idleSuspendSec: number; // 0 = auto-suspend off
+    idleActivity: IdleSignal[];
+    spot: boolean;
+  };
 }
 
 const RECIPE_REL_PATH = path.join(".kodus", "workspace.yaml");
+
+/** What keeps a VM awake: an SSH session, external traffic, a coding agent using CPU. */
+export const IDLE_SIGNALS = ["ssh", "net", "agent"] as const;
+export type IdleSignal = (typeof IDLE_SIGNALS)[number];
 
 export function parseRecipe(yamlText: string, source: string): NormalizedRecipe {
   let raw: any;
@@ -109,6 +119,19 @@ export function parseRecipe(yamlText: string, source: string): NormalizedRecipe 
     idleSuspendSec = Number(m[1]) * (m[2] === "h" ? 3600 : m[2] === "m" ? 60 : 1);
   }
 
+  // idle_activity: which signals count as use (default all). A public preview
+  // drops "net": bots and its own outbound calls never let it look idle, so
+  // the clock runs from the last `runo up` instead.
+  const activityRaw = raw.limits?.idle_activity ?? [...IDLE_SIGNALS];
+  const idleActivity = (Array.isArray(activityRaw) ? activityRaw : [activityRaw]).map((a: unknown) =>
+    String(a).toLowerCase(),
+  );
+  const unknownSignal = idleActivity.find((a) => !(IDLE_SIGNALS as readonly string[]).includes(a));
+  if (unknownSignal !== undefined)
+    throw new RunoError(
+      `Invalid recipe (${source}): limits.idle_activity "${unknownSignal}" — use any of ${IDLE_SIGNALS.join(", ")}`,
+    );
+
   const exposeMode = String(raw.expose?.mode ?? "ip").toLowerCase();
   if (!["ip", "https", "tunnel"].includes(exposeMode))
     throw new RunoError(
@@ -129,6 +152,7 @@ export function parseRecipe(yamlText: string, source: string): NormalizedRecipe 
     instance: String(raw.limits?.instance ?? "t3.medium"),
     diskGb: Number(diskMatch[1]),
     idleSuspendSec,
+    idleActivity: [...new Set(idleActivity)] as IdleSignal[],
     spot: raw.limits?.spot === true, // ~70% cheaper; interruption becomes "stop" (= suspend)
   };
 
