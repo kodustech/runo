@@ -1,9 +1,8 @@
-node_modules/
-.env
 .runo-deploy/
 .playwright-mcp/
 .pnpm-store/
-website/dist/
+.env*
+node_modules/
+website/node_modules/
 website/.preview/
-.vercel/
 docs/media/.render/
