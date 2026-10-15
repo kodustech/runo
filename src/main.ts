@@ -69,6 +69,10 @@ Usage: runo <command> [args]
   suspend | resume            stop/start the instance (stopped costs no compute)
   bake [--rm]                 bakes a base image with provisioning done —
                               subsequent runo up boot in ~1-2min (--rm removes)
+  bake --from-env             the repo's base image from this env's disk, warm
+                              (deps, builds, caches); new envs of the repo boot
+                              from it and only sync what changed. Leaves the env
+                              stopped
   pool [n]                    warm pool: n provisioned, STOPPED instances
                               (EBS-only cost); runo new claims from it (~40s).
                               No argument shows status; 0 drains the pool
@@ -86,6 +90,7 @@ interface Flags {
   restart: boolean;
   rm: boolean;
   warm: boolean;
+  fromEnv: boolean;
   here: boolean;
   validate: boolean;
   destroyAfter: boolean;
@@ -102,6 +107,7 @@ function parseFlags(args: string[]): Flags {
     restart: false,
     rm: false,
     warm: false,
+    fromEnv: false,
     here: false,
     validate: false,
     destroyAfter: false,
@@ -136,6 +142,7 @@ function parseFlags(args: string[]): Flags {
     else if (a === "--restart") f.restart = true;
     else if (a === "--rm") f.rm = true;
     else if (a === "--warm") f.warm = true;
+    else if (a === "--from-env") f.fromEnv = true;
     else if (a === "--here") f.here = true;
     else if (a === "--validate") f.validate = true;
     else if (a === "--destroy") f.destroyAfter = true;
@@ -731,7 +738,38 @@ async function cmdResume(flags: Flags): Promise<void> {
   await resumeEnv(contextFromEnv(env));
 }
 
+/**
+ * The repo's base image from an env that already ran the recipe: its disk
+ * carries dependencies, builds and caches, so a new env of the repo only
+ * syncs what its commit changed (uploadCode's warm path). What belongs to
+ * this env, not to the repo, leaves the disk first.
+ */
+async function cmdBakeFromEnv(flags: Flags): Promise<void> {
+  const env = resolveEnv({ branch: flags.branch, profile: flags.profile });
+  const provider = getProvider(env.provider);
+  if (!provider.imageFromRuntime)
+    throw new RunoError(`The ${provider.name} provider cannot bake from an environment`, "Use runo bake --warm");
+  const ctx = contextFromEnv(env);
+  const rt = await runningRuntime(env);
+  const remoteDir = remoteRepoDir(env.repo);
+  log.step("removing what belongs to this env, not to the image (files.copy, agent credentials, logs)…");
+  const scrub = [
+    ...ctx.recipe.filesCopy.map((rel) => `rm -f ${shq(`${remoteDir}/${rel}`)}`),
+    `rm -f ${REMOTE_RUNO_DIR}/agent.env`,
+    `rm -rf ${REMOTE_RUNO_DIR}/evidence ${REMOTE_RUNO_DIR}/logs/*`,
+    // uploadCode syncs into a tree marked warm instead of replacing it
+    `echo ${shq(env.repo)} > ${REMOTE_RUNO_DIR}/warm-base`,
+  ].join(" && ");
+  const r = await provider.exec(rt, scrub);
+  if (r.exitCode !== 0) throw new RunoError(`Could not prepare the disk: ${r.stderr.trim()}`);
+  const image = await provider.imageFromRuntime(rt, env.repo);
+  registry.upsert({ ...env, state: "stopped", updatedAt: new Date().toISOString() });
+  log.ok(`base image for ${env.repo}: ${image} — new envs of the repo boot from it`);
+  log.info(`${env.name} is stopped and lost its files.copy: runo up --branch ${env.branch} brings it back`);
+}
+
 async function cmdBake(flags: Flags): Promise<void> {
+  if (flags.fromEnv) return await cmdBakeFromEnv(flags);
   const provider = getProvider();
   await provider.preflight();
   if (flags.rm) {

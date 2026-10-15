@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import path from "node:path";
-import { TMP_DIR, remoteRepoDir } from "../config";
+import { REMOTE_RUNO_DIR, TMP_DIR, remoteRepoDir } from "../config";
 import { RunoError } from "../errors";
 import { log } from "../log";
 import { getProvider, defaultProviderName } from "../provider";
@@ -41,6 +41,35 @@ function baseRecord(ctx: EnvContext): EnvRecord {
       updatedAt: new Date().toISOString(),
     }
   );
+}
+
+/**
+ * Shell that puts the uploaded commit (a tar of tracked files) at remoteDir.
+ *
+ * Cold: replace the tree. sudo, because containers may have written
+ * root-owned files (node_modules) into the bind-mounted tree.
+ *
+ * Warm (the tree came with the repo's base image): delete only the files the
+ * tree's git tracked and the commit no longer has, then copy the commit over.
+ * Ignored files (dependencies, build output, caches) are never in `git
+ * ls-files`, so they stay, and that is the whole point of the image.
+ * Unchanged files keep their mtime, so the builds that came with the image
+ * stay up to date for everything the commit did not touch.
+ */
+export function codeExtractCommand(remoteDir: string, tar: string, warm: boolean): string {
+  const dir = shq(remoteDir);
+  if (!warm) return `sudo rm -rf ${dir} && mkdir -p ${dir} && tar -xf ${shq(tar)} -C ${dir} && rm -f ${shq(tar)}`;
+  const stage = shq(`${remoteDir}.runo-stage`);
+  return [
+    "set -e",
+    `rm -rf ${stage} && mkdir -p ${stage} && tar -xf ${shq(tar)} -C ${stage} && rm -f ${shq(tar)}`,
+    `cd ${dir}`,
+    `LC_ALL=C comm -23 <(git -c core.quotePath=false ls-files | LC_ALL=C sort) <(cd ${stage} && find . \\( -type f -o -type l \\) | sed 's|^\\./||' | LC_ALL=C sort) | while IFS= read -r f; do rm -f -- "$f"; done`,
+    // by content, keeping mtimes: only files the commit changed get a new
+    // mtime, so incremental builds (tsc -b) see exactly those as changed
+    `rsync -rlpD --checksum ${stage}/ ./`,
+    `rm -rf ${stage}`,
+  ].join("\n");
 }
 
 export async function uploadCode(
@@ -111,12 +140,13 @@ export async function uploadCode(
   }
   await provider.upload(rt, tarPath, "/tmp/runo-code.tar");
   rmSync(tarPath, { force: true });
-  // sudo: containers may have written root-owned files (node_modules) into
-  // the bind-mounted tree — a plain rm as the ssh user cannot remove them
-  const extract = await provider.exec(
-    rt,
-    `sudo rm -rf ${shq(remoteDir)} && mkdir -p ${shq(remoteDir)} && tar -xf /tmp/runo-code.tar -C ${shq(remoteDir)} && rm -f /tmp/runo-code.tar`,
-  );
+  // A VM booted from the repo's base image (runo bake --from-env) already has
+  // the tree, with dependencies and builds: sync it instead of replacing it.
+  const warm =
+    (await provider.exec(rt, `test -d ${shq(remoteDir)}/.git && grep -qx ${shq(ctx.repoName)} ${REMOTE_RUNO_DIR}/warm-base`))
+      .exitCode === 0;
+  if (warm) log.step("tree already on the VM (base image) — syncing the commit, keeping dependencies and builds");
+  const extract = await provider.exec(rt, codeExtractCommand(remoteDir, "/tmp/runo-code.tar", warm));
   if (extract.exitCode !== 0)
     throw new RunoError(`Code extraction on the VM failed: ${extract.stderr.trim()}`);
 
@@ -126,7 +156,7 @@ export async function uploadCode(
   const localSha = git(ctx.worktree, "rev-parse", "--short", "HEAD").stdout || "unknown";
   const init = await provider.exec(
     rt,
-    `git init -q -b ${shq(ctx.branch)} && git add -A && git -c user.name=runo -c user.email=runo@kodus.local commit -qm ${shq(`runo: upload ${localSha}`)}`,
+    `git init -q -b ${shq(ctx.branch)} && ${warm ? `git checkout -q -B ${shq(ctx.branch)} && ` : ""}git add -A && git -c user.name=runo -c user.email=runo@kodus.local commit -q${warm ? " --allow-empty" : ""} -m ${shq(`runo: upload ${localSha}`)}`,
     { cwd: remoteDir },
   );
   if (init.exitCode !== 0)

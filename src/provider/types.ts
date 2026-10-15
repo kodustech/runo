@@ -118,6 +118,14 @@ export interface RuntimeProvider {
   /** Removes the baked base image (runo bake --rm). */
   removeBootImage(): Promise<void>;
 
+  /**
+   * Bakes the repo's base image from an environment's own disk (runo bake
+   * --from-env): the env already ran the recipe and is warm, so new envs of
+   * the repo boot with its dependencies, builds and caches in place. Leaves
+   * the env stopped.
+   */
+  imageFromRuntime?(rt: Runtime, repo: string): Promise<string>;
+
   /** Warm pool: provisioned, stopped instances ready to be claimed on create. */
   poolStatus(): Promise<Runtime[]>;
   poolScale(target: number): Promise<void>;

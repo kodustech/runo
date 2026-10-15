@@ -55,6 +55,12 @@ function labelValue(raw: string): string {
   return raw.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").slice(0, 63);
 }
 
+/** Image family of a repo's base image: one per repo and install. */
+export function imageFamilyFor(repo: string): string {
+  const slug = repo.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "repo";
+  return `runo-${HASH6}-${slug}`.slice(0, 50).replace(/-+$/, "");
+}
+
 export function mapState(status: string | undefined): RuntimeState {
   switch (status) {
     case "PROVISIONING":
@@ -310,6 +316,7 @@ export class GceProvider extends SshVmProvider implements RuntimeProvider {
       launchedAt: i.lastStartTimestamp ?? i.creationTimestamp,
       name: meta["runo-env-name"] ?? i.name,
       lifecycle: i.scheduling?.provisioningModel === "SPOT" ? "spot" : undefined,
+      bootDisk: (i.disks ?? []).find((d: any) => d.boot)?.source,
       ...(meta["runo-profile"] ? { profile: meta["runo-profile"] } : {}),
     };
   }
@@ -349,16 +356,29 @@ export class GceProvider extends SshVmProvider implements RuntimeProvider {
       );
   }
 
-  private instanceBody(spec: CreateSpec, name: string, machineType: string, spot: boolean): Record<string, unknown> {
+  private instanceBody(
+    spec: CreateSpec,
+    name: string,
+    machineType: string,
+    spot: boolean,
+    base: { image: string; diskGb: number } | null = null,
+  ): Record<string, unknown> {
     const publicKey = readFileSync(`${this.keyPath}.pub`, "utf8").trim();
-    const cloudInit = readFileSync(new URL("../../image/cloud-init.yaml", import.meta.url).pathname, "utf8");
     const labels = {
       runo_managed: "true",
       runo_home_hash: HASH6,
       runo_env: labelValue(spec.slug),
     };
     const items: Record<string, string> = {
-      "user-data": gceCloudInit(cloudInit, publicKey),
+      // a repo's base image was provisioned already: no cloud-init to run
+      ...(base
+        ? {}
+        : {
+            "user-data": gceCloudInit(
+              readFileSync(new URL("../../image/cloud-init.yaml", import.meta.url).pathname, "utf8"),
+              publicKey,
+            ),
+          }),
       "ssh-keys": `ubuntu:${publicKey}`,
       // runo's key is the only way in: no OS Login, no project-wide keys
       "enable-oslogin": "FALSE",
@@ -379,8 +399,9 @@ export class GceProvider extends SshVmProvider implements RuntimeProvider {
           boot: true,
           autoDelete: true,
           initializeParams: {
-            sourceImage: this.image,
-            diskSizeGb: String(spec.diskGb),
+            sourceImage: base?.image ?? this.image,
+            // never smaller than the image it is created from
+            diskSizeGb: String(Math.max(spec.diskGb, base?.diskGb ?? 0)),
             diskType: `zones/${this.zone}/diskTypes/${this.diskType}`,
             labels,
           },
@@ -431,8 +452,10 @@ export class GceProvider extends SshVmProvider implements RuntimeProvider {
     if (machineType !== spec.instanceType)
       log.dim(`${spec.instanceType} → ${machineType} (same vCPU and memory on Compute Engine)`);
 
+    const base = await this.repoImage(spec.repo);
+    if (base) log.dim(`booting from ${spec.repo}'s base image ${base.name} (runo bake --from-env)`);
     const launch = async (spot: boolean) => {
-      const op = await this.api("POST", `zones/${this.zone}/instances`, this.instanceBody(spec, name, machineType, spot));
+      const op = await this.api("POST", `zones/${this.zone}/instances`, this.instanceBody(spec, name, machineType, spot, base));
       await this.waitOp(op);
     };
     try {
@@ -520,18 +543,92 @@ export class GceProvider extends SshVmProvider implements RuntimeProvider {
     }
   }
 
-  // ---------- not offered on Compute Engine yet ----------
+  // ---------- base images (runo bake --from-env) ----------
+
+  private async repoImages(repo?: string): Promise<any[]> {
+    const filter = [
+      `labels.runo_home_hash = "${HASH6}"`,
+      ...(repo ? [`labels.runo_base_image = "${labelValue(repo)}"`] : []),
+    ].join(" AND ");
+    const page = await this.api("GET", `global/images?${new URLSearchParams({ filter })}`);
+    return (page?.items ?? [])
+      .filter((i: any) => !repo || i.status === "READY")
+      .sort((a: any, b: any) => String(b.creationTimestamp ?? "").localeCompare(String(a.creationTimestamp ?? "")));
+  }
+
+  /** The newest ready base image of the repo, when one was baked. */
+  private async repoImage(repo: string): Promise<{ name: string; image: string; diskGb: number } | null> {
+    try {
+      const newest = (await this.repoImages(repo))[0];
+      return newest ? { name: newest.name, image: `global/images/${newest.name}`, diskGb: Number(newest.diskSizeGb ?? 0) } : null;
+    } catch (e: any) {
+      log.warn(`could not look up ${repo}'s base image (${e?.message ?? e}) — booting the stock image`);
+      return null;
+    }
+  }
+
+  async imageFromRuntime(rt: Runtime, repo: string): Promise<string> {
+    let fresh = await this.describe(rt.id);
+    if (fresh.state === "terminated") throw new RunoError(`Instance ${rt.id} no longer exists`);
+    // the disk has to be quiet: a suspended VM still owns its memory state
+    if (fresh.gceStatus === "SUSPENDED") {
+      await this.waitOp(await this.api("POST", `${this.inst(rt.id)}/resume`));
+      fresh = await this.waitForState(rt.id, "running", 5 * 60_000);
+    }
+    if (fresh.state !== "stopped") {
+      log.step("stopping the environment to image its disk…");
+      await this.waitOp(await this.api("POST", `${this.inst(rt.id)}/stop`));
+      fresh = await this.waitForState(rt.id, "stopped", 10 * 60_000);
+    }
+    const disk = String(fresh.bootDisk ?? "");
+    const at = disk.indexOf(`/projects/${this.project}/`);
+    if (at < 0) throw new RunoError(`Could not find the boot disk of ${rt.id}`);
+    const family = imageFamilyFor(repo);
+    const name = `${family}-${Date.now().toString(36)}`;
+    const labels = { runo_managed: "true", runo_home_hash: HASH6, runo_base_image: labelValue(repo) };
+    log.step(`creating image ${name} from ${rt.name ?? rt.id}…`);
+    await this.waitOp(
+      await this.api("POST", "global/images", {
+        name,
+        family,
+        sourceDisk: disk.slice(at + `/projects/${this.project}/`.length),
+        labels,
+        description: `runo base image for ${repo}, from ${rt.name ?? rt.id}`,
+      }),
+      30 * 60_000,
+    );
+    // keep the previous one: a bad bake must be one delete away from rollback
+    for (const old of (await this.repoImages(repo)).slice(2)) {
+      try {
+        await this.waitOp(await this.api("DELETE", `global/images/${old.name}`));
+        log.dim(`old image ${old.name} removed`);
+      } catch (e: any) {
+        log.warn(`could not remove old image ${old.name}: ${e?.message ?? e}`);
+      }
+    }
+    return name;
+  }
 
   async prepareBootImage(): Promise<string> {
     throw new RunoError(
-      "runo bake is not available on Compute Engine yet",
-      "Environments boot from the stock Ubuntu image and run the full provisioning",
+      "runo bake on Compute Engine images an environment that already ran the recipe",
+      "Bring an env up (runo up), let it finish, then run `runo bake --from-env`",
     );
   }
 
   async removeBootImage(): Promise<void> {
-    log.warn("no baked image to remove (runo bake is not available on Compute Engine)");
+    const images = await this.repoImages();
+    if (!images.length) {
+      log.warn("no base image to remove");
+      return;
+    }
+    for (const img of images) {
+      await this.waitOp(await this.api("DELETE", `global/images/${img.name}`));
+      log.ok(`image ${img.name} removed`);
+    }
   }
+
+  // ---------- not offered on Compute Engine yet ----------
 
   async poolStatus(): Promise<Runtime[]> {
     return [];

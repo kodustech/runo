@@ -326,7 +326,18 @@ a token, unchanged) or a laptop in direct mode.
 - **Suspend** uses Compute Engine suspend (RAM → disk) and falls back to stop;
   spot VMs stop. Idle auto-suspend powers off from inside, which Compute
   Engine reports as `TERMINATED`, its word for stopped.
-- **Not yet**: `runo bake` and `runo pool`.
+- **Base image per repo** (`runo bake --from-env`): instead of a bake VM, the
+  image is taken from an env that already ran the recipe and is warm. Before
+  imaging, runo removes the recipe's `files.copy`, the agent credentials and the
+  logs from the disk. Every new env of that repo boots from the newest image
+  (family `runo-<hash6>-<repo>`, the previous one is kept for rollback), skips
+  cloud-init, and its upload **syncs** instead of replacing the tree: files the
+  commit removed go, files it changed are copied by content, and everything git
+  ignores (dependencies, build output, caches) stays. Only changed files get a
+  new mtime, so incremental builds redo only what the commit touched. The env
+  it came from is left stopped; `runo up` brings it back. Through the control
+  plane, baking is admin-only. `runo bake --rm` deletes this install's images.
+- **Not yet**: `runo pool`.
 
 ## Teams: control plane. no AWS credentials on laptops
 

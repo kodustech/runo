@@ -1,7 +1,10 @@
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { parse } from "yaml";
-import { GceError, GceProvider, gceCloudInit, instanceNameFor, machineTypeFor, mapState } from "./gce";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { GceError, GceProvider, gceCloudInit, imageFamilyFor, instanceNameFor, machineTypeFor, mapState } from "./gce";
 
 const done = { status: "DONE", selfLink: "https://compute.googleapis.com/op" };
 
@@ -11,8 +14,18 @@ function providerWith(api: (method: string, path: string, body?: any) => Promise
   (p as any).pollMs = 1;
   (p as any).ensureLocalKey = () => false;
   (p as any).instanceBody = () => ({});
+  (p as any).repoImage = async () => null;
   return p;
 }
+
+function withKey(p: GceProvider): GceProvider {
+  const dir = mkdtempSync(path.join(tmpdir(), "runo-gce-"));
+  writeFileSync(path.join(dir, "k.pub"), "ssh-ed25519 AAAAkey runo\n");
+  Object.defineProperty(p, "keyPath", { get: () => path.join(dir, "k") });
+  return p;
+}
+
+const spec = { envName: "runo-abc123-b", slug: "b", instanceType: "e2-standard-4", diskGb: 40, repo: "app", branch: "feat/b" };
 
 const instance = (name: string, meta: Record<string, string>, extra: Record<string, unknown> = {}) => ({
   name,
@@ -121,4 +134,55 @@ test("resume uses `resume` for a suspended instance and `start` for a stopped on
   status = "TERMINATED";
   await p.resume({ id: "runo-abc123-b", ip: null, state: "stopped" });
   expect(verbs).toEqual(["resume", "start"]);
+});
+
+test("an env of a repo with a base image boots from it, without cloud-init, on a disk at least as large", () => {
+  const p = withKey(new GceProvider());
+  const body: any = (p as any).instanceBody(spec, "n", "e2-standard-4", false, { name: "img", image: "global/images/img", diskGb: 80 });
+  const disk = body.disks[0].initializeParams;
+  expect(disk.sourceImage).toBe("global/images/img");
+  expect(disk.diskSizeGb).toBe("80");
+  const keys = body.metadata.items.map((i: any) => i.key);
+  expect(keys).not.toContain("user-data");
+  expect(keys).toContain("ssh-keys");
+  const cold: any = (p as any).instanceBody(spec, "n", "e2-standard-4", false, null);
+  expect(cold.metadata.items.map((i: any) => i.key)).toContain("user-data");
+  expect(cold.disks[0].initializeParams.diskSizeGb).toBe("40");
+  expect(cold.serviceAccounts).toEqual([]);
+});
+
+test("bake from an env stops it, images its boot disk into the repo's family and keeps two images", async () => {
+  const calls: string[] = [];
+  let status = "RUNNING";
+  let inserted: any;
+  const images = ["c", "b", "a"].map((n, i) => ({ name: `img-${n}`, status: "READY", creationTimestamp: `2026-10-1${5 - i}` }));
+  const p = providerWith(async (method, path, body) => {
+    calls.push(`${method} ${path.split("?")[0]}`);
+    if (method === "GET" && path.startsWith("zones/"))
+      return instance("runo-abc123-main", {}, {
+        status,
+        disks: [{ boot: true, source: "https://www.googleapis.com/compute/v1/projects/proj/zones/us-central1-a/disks/runo-abc123-main" }],
+      });
+    if (method === "POST" && path.endsWith("/stop")) { status = "TERMINATED"; return done; }
+    if (method === "POST" && path === "global/images") { inserted = body; return done; }
+    if (method === "GET" && path.startsWith("global/images")) return { items: images };
+    if (method === "DELETE") return done;
+    throw new Error(`unexpected ${method} ${path}`);
+  });
+  (p as any).project = "proj";
+  const name = await p.imageFromRuntime({ id: "runo-abc123-main", ip: null, state: "running" }, "app");
+  expect(inserted.sourceDisk).toBe("zones/us-central1-a/disks/runo-abc123-main");
+  expect(inserted.family).toBe(imageFamilyFor("app"));
+  expect(inserted.labels.runo_base_image).toBe("app");
+  expect(name.startsWith(imageFamilyFor("app"))).toBe(true);
+  expect(calls).toContain("POST zones/us-central1-a/instances/runo-abc123-main/stop");
+  expect(calls.filter((c) => c.startsWith("DELETE"))).toEqual(["DELETE global/images/img-a"]);
+});
+
+test("image families are valid Compute Engine names", () => {
+  for (const repo of ["app", "Brendi_App", "kodus-ai", "a".repeat(80)]) {
+    const f = imageFamilyFor(repo);
+    expect(f).toMatch(/^[a-z]([-a-z0-9]*[a-z0-9])?$/);
+    expect(f.length).toBeLessThanOrEqual(50);
+  }
 });

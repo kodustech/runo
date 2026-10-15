@@ -130,6 +130,7 @@ const RPC_ALLOWED = new Set([
   "poolScale",
   "prepareBootImage",
   "removeBootImage",
+  "imageFromRuntime",
 ]);
 
 async function handleRpc(who: Identity, body: any): Promise<Response> {
@@ -140,13 +141,16 @@ async function handleRpc(who: Identity, body: any): Promise<Response> {
     throw new AccessDenied("This operation needs a CLI token, not a browser session");
   const envsBefore = Object.values(loadEnvs());
   let target: ServerEnv | undefined;
-  if (["waitReady", "status", "suspend", "resume", "destroy"].includes(method)) {
+  if (["waitReady", "status", "suspend", "resume", "destroy", "imageFromRuntime"].includes(method)) {
     // admins manage any machine's lifecycle (cost control) but waitReady execs on the VM
     target = requireAccess(user, args[0]?.id, envsBefore, method !== "status", who.admin && method !== "waitReady");
     args[0] = await provider.status({ id: target.instanceId, ip: null, state: "unknown" });
   }
-  if (["poolScale", "prepareBootImage", "removeBootImage"].includes(method) && !who.admin)
+  // a repo's base image is what every new env of that repo boots from
+  if (["poolScale", "prepareBootImage", "removeBootImage", "imageFromRuntime"].includes(method) && !who.admin)
     throw new AccessDenied("This operation requires an admin");
+  if (typeof (provider as any)[method] !== "function")
+    throw new RunoError(`${method} is not available on the ${provider.name} provider`);
   // the security group is shared by the whole fleet: users open only what policy lists
   if (method === "ensurePorts" && !who.admin) {
     const allowed = loadPolicies().allowed_public_ports ?? DEFAULT_PUBLIC_PORTS;
@@ -188,6 +192,8 @@ async function handleRpc(who: Identity, body: any): Promise<Response> {
     void sampleNow();
   }
   if (method === "poolScale") store.addEvent({ actor: user, action: "pool.scale", detail: { target: args[0] } });
+  if (method === "imageFromRuntime")
+    store.addEvent({ actor: user, action: "image.bake", envName: target!.envName, instanceId: target!.instanceId, detail: { image: result } });
   if (method === "ensurePorts") store.addEvent({ actor: user, action: "ports.open", detail: { ports: args[0] } });
   if (method === "create") {
     const spec = args[0];
