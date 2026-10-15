@@ -7,6 +7,7 @@ Detailed configuration for Runo. Start with the [quickstart](quickstart.md) for 
 | Var | Default | Effect |
 | --- | --- | --- |
 | `RUNO_HOME` | `~/.runo` | state root (registry, worktrees, SSH keys). Parallel installs MUST use distinct RUNO_HOMEs |
+| `RUNO_PROVIDER` | `aws` | cloud for direct mode and for runo-server: `aws` or `gce` (see "Google Compute Engine") |
 | `RUNO_AWS_REGION` | `sa-east-1` | EC2 region (compare current AWS prices for your region) |
 | `RUNO_DEBUG` | : | `1` prints stack traces |
 | `RUNO_RECIPE` | `.kodus/workspace.yaml` | which recipe to read (same as `--recipe`) : one repo can describe a dev box AND a PR preview |
@@ -291,6 +292,41 @@ runo up --here
 - **Local registry**: `$RUNO_HOME/envs.json`.
 - **Cost guardrails**: max 3 RUNNING instances *per install* (scoped by the
   `runo:home-hash` tag); everything tagged `runo:managed=true`.
+
+## Google Compute Engine (`RUNO_PROVIDER=gce`)
+
+The same recipes run on Compute Engine. Set `RUNO_PROVIDER=gce` where VMs are
+created: the control plane (developers, CI and agents keep talking to it with
+a token, unchanged) or a laptop in direct mode.
+
+| Var | Default | Effect |
+| --- | --- | --- |
+| `RUNO_GCP_PROJECT` | (required) | project the VMs live in. Use a project of their own, not production's |
+| `RUNO_GCP_ZONE` | `us-central1-a` | zone of every env VM |
+| `RUNO_GCP_NETWORK` | `default` | VPC network |
+| `RUNO_GCP_SUBNET` | : | subnetwork, required on custom-mode networks |
+| `RUNO_GCP_IMAGE` | Ubuntu 24.04 LTS family | boot image |
+| `RUNO_GCP_DISK_TYPE` | `pd-balanced` | boot disk type |
+| `RUNO_EXPECTED_GCP_IDENTITY` | : | refuse to run as any other account / service account |
+
+- **Credentials**: on a Compute Engine VM, the attached service account via
+  the metadata server; elsewhere `gcloud auth print-access-token`. It needs
+  `roles/compute.instanceAdmin.v1` and `roles/compute.securityAdmin` (one
+  firewall rule, `runo-<hash6>`, opens 22 and the public ports to the env VMs'
+  network tag).
+- **Env VMs have no service account**: nothing running on them holds Google
+  Cloud credentials. Recipes that need cloud access must bring their own.
+- **Machine types**: a recipe may name a Compute Engine type
+  (`e2-standard-8`); EC2 sizes map to the E2 type with the same vCPU and
+  memory (`t3.xlarge` → `e2-standard-4`), so one recipe serves both clouds.
+  Policies on the server match the recipe's value as written.
+- **Identity**: labels `runo_managed`, `runo_home_hash` and `runo_env`, plus
+  instance metadata `runo-repo`, `runo-branch`, `runo-profile` (branch names do
+  not fit label values).
+- **Suspend** uses Compute Engine suspend (RAM → disk) and falls back to stop;
+  spot VMs stop. Idle auto-suspend powers off from inside, which Compute
+  Engine reports as `TERMINATED`, its word for stopped.
+- **Not yet**: `runo bake` and `runo pool`.
 
 ## Teams: control plane. no AWS credentials on laptops
 

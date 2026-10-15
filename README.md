@@ -60,7 +60,7 @@ When the change is ready, `runo ship "your commit message" --validate` pulls the
 
 ## Costs and boundaries
 
-- The current runtime provider is AWS EC2. With a control plane, the operator supplies AWS access; individual developers use a Runo token.
+- Runtime providers: AWS EC2 (default) and Google Compute Engine (`RUNO_PROVIDER=gce`, see the [reference](docs/reference.md#google-compute-engine-runo_providergce)). With a control plane, the operator supplies cloud access; individual developers use a Runo token.
 - Database creation and seeding depend on your recipe. External databases remain shared if your configuration points multiple environments at the same database.
 - Preview URLs do not add authentication to your app. Use development data and credentials.
 - A stopped VM can still incur storage charges. `runo destroy` removes the environment and its managed worktree; pull and save any changes you need first.

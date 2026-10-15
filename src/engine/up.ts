@@ -3,7 +3,7 @@ import path from "node:path";
 import { TMP_DIR, remoteRepoDir } from "../config";
 import { RunoError } from "../errors";
 import { log } from "../log";
-import { getProvider } from "../provider";
+import { getProvider, defaultProviderName } from "../provider";
 import type { Runtime, RuntimeProvider } from "../provider/types";
 import { registry, urlsFor, type EnvRecord } from "../registry";
 import { shq } from "../ssh";
@@ -33,7 +33,7 @@ function baseRecord(ctx: EnvContext): EnvRecord {
       profile: ctx.profile,
       worktree: ctx.worktree,
       externalWorktree: ctx.externalWorktree,
-      provider: "aws",
+      provider: defaultProviderName(),
       runtime: {},
       state: "creating",
       publicServices: [],
@@ -262,7 +262,7 @@ async function finishUp(
  * the behavior of `runo up`).
  */
 export async function upEnv(ctx: EnvContext): Promise<EnvRecord> {
-  const provider = getProvider("aws");
+  const provider = getProvider();
   await provider.preflight();
 
   let env = baseRecord(ctx);
@@ -385,7 +385,7 @@ export async function upEnv(ctx: EnvContext): Promise<EnvRecord> {
 
 /** Instance start + IP redetection + services back up. */
 export async function resumeEnv(ctx: EnvContext): Promise<EnvRecord> {
-  const provider = getProvider("aws");
+  const provider = getProvider();
   const env = registry.get(ctx.envName);
   if (!env?.runtime || !(env.runtime as any).id)
     throw new RunoError(`Environment ${ctx.envName} does not exist in the registry`, "Create it with `runo new` / `runo up`");

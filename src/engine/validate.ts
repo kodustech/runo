@@ -36,7 +36,7 @@ export interface Evidence {
  * into the local worktree — the future contract with Kody.
  */
 export async function validateEnv(ctx: EnvContext, onlyStep?: string): Promise<Evidence> {
-  const provider = getProvider("aws");
+  const provider = getProvider();
   const env = registry.get(ctx.envName);
   if (!env) throw new RunoError(`Environment ${ctx.envName} is not registered`, "Create it with `runo new`/`runo up`");
   const rt = await provider.status(env.runtime as unknown as Runtime);

@@ -33,6 +33,13 @@ const US_EAST: Record<string, number> = {
   "c7i.large": 0.08925, "c7i.xlarge": 0.1785, "c7i.2xlarge": 0.357,
 };
 
+// Compute Engine, on-demand E2 (the shapes runo maps EC2 sizes to)
+const GCE_US_CENTRAL: Record<string, number> = {
+  "e2-micro": 0.008376, "e2-small": 0.016751, "e2-medium": 0.033503,
+  "e2-standard-2": 0.067006, "e2-standard-4": 0.134012, "e2-standard-8": 0.268024,
+  "e2-standard-16": 0.536048,
+};
+
 const BY_REGION: Record<string, Record<string, number>> = {
   "us-east-1": US_EAST,
   "us-east-2": US_EAST,
@@ -40,9 +47,22 @@ const BY_REGION: Record<string, Record<string, number>> = {
     "t3.micro": 0.0168, "t3.small": 0.0336, "t3.medium": 0.0672, "t3.large": 0.1344,
     "t3.xlarge": 0.2688, "t3.2xlarge": 0.5376,
   },
+  "us-central1": GCE_US_CENTRAL,
 };
 
+/** Compute Engine regions end in a digit with no dash before it ("us-central1"); EC2 ones do ("us-east-1"). */
+const isGceRegion = (region: string) => /^[a-z]+-[a-z]+\d+$/.test(region);
+
 export function defaultPricing(region: string): Pricing {
+  if (isGceRegion(region))
+    return {
+      instance_hourly: { ...(BY_REGION[region] ?? {}) },
+      spot_factor: 1,
+      // pd-balanced; runo provisions no extra IOPS on Compute Engine
+      ebs_gb_month: 0.1,
+      ebs_extra_month: 0,
+      ipv4_hourly: 0.005,
+    };
   return {
     instance_hourly: { ...(BY_REGION[region] ?? {}) },
     spot_factor: 1,

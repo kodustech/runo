@@ -23,6 +23,8 @@ import { AWS_REGION, RUNO_HOME } from "../src/config";
 import { RunoError } from "../src/errors";
 import { log } from "../src/log";
 import { Ec2Provider } from "../src/provider/aws";
+import { GceProvider } from "../src/provider/gce";
+import { defaultProviderName } from "../src/provider";
 import type { CreateSpec, ExecOpts, Runtime } from "../src/provider/types";
 import { DEFAULT_PUBLIC_PORTS, enforceCreate, loadPolicies } from "./policies";
 import { AccessDenied, canAccess, requireAccess } from "./access";
@@ -33,7 +35,9 @@ import { isUp, sampleFleet, vanishedEnvs } from "./usage";
 import { randomBytes } from "node:crypto";
 
 const PORT = Number(process.env.RUNO_SERVER_PORT || argValue("--port") || 7777);
-const provider = new Ec2Provider();
+// RUNO_PROVIDER picks the cloud this control plane manages (aws | gce)
+const provider = defaultProviderName() === "gce" ? new GceProvider() : new Ec2Provider();
+const REGION = provider instanceof GceProvider ? provider.region : AWS_REGION;
 
 // ---------- auth ----------
 
@@ -497,7 +501,9 @@ interface TtyData {
   proc: ReturnType<typeof Bun.spawn>;
 }
 
-if (process.env.RUNO_EXPECTED_AWS_ARN || process.env.RUNO_EXPECTED_AWS_REGION)
+// Compute Engine always checks project access before listening; AWS only
+// when the deployment pins an identity.
+if (provider instanceof GceProvider || process.env.RUNO_EXPECTED_AWS_ARN || process.env.RUNO_EXPECTED_AWS_REGION)
   await provider.preflight();
 
 const server = Bun.serve<TtyData>({
@@ -546,7 +552,7 @@ const server = Bun.serve<TtyData>({
     if (url.pathname === "/v1/health" && req.method === "GET") return json({ ok: true, name: "runo-server", user });
 
     try {
-      const panel = await handlePanelApi({ store, auth, provider, region: AWS_REGION, ingressDomain: INGRESS_DOMAIN }, req, url, who);
+      const panel = await handlePanelApi({ store, auth, provider, region: REGION, ingressDomain: INGRESS_DOMAIN }, req, url, who);
       if (panel) return panel;
       if (url.pathname === "/v1/rpc" && req.method === "POST")
         return await handleRpc(who, await req.json());

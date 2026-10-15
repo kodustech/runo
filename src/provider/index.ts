@@ -1,15 +1,22 @@
 import { RunoError } from "../errors";
 import { Ec2Provider } from "./aws";
+import { GceProvider } from "./gce";
 import { RemoteProvider } from "./remote";
 import type { RuntimeProvider } from "./types";
 
 const providers: Record<string, () => RuntimeProvider> = {
   aws: () => new Ec2Provider(),
+  gce: () => new GceProvider(),
 };
+
+/** Which cloud direct mode (and the control plane) creates VMs in: RUNO_PROVIDER, default aws. */
+export function defaultProviderName(): string {
+  return process.env.RUNO_PROVIDER?.trim() || "aws";
+}
 
 let cached: RuntimeProvider | undefined;
 
-export function getProvider(name = "aws"): RuntimeProvider {
+export function getProvider(name = defaultProviderName()): RuntimeProvider {
   // Control-plane mode: RUNO_SERVER set → every provider operation goes to
   // runo-server (which holds the AWS credentials); the laptop needs none.
   const server = process.env.RUNO_SERVER;
