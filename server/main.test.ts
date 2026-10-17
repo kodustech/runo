@@ -135,6 +135,7 @@ test("a browser session runs the panel but cannot reach a VM, skip CSRF, or act 
   expect((await session("/v1/exec", "POST", { rt, command: "id" })).status).toBe(403);
   expect((await session(`/v1/tty?rt=${encodeURIComponent(JSON.stringify(rt))}&cmd=eA==`)).status).toBe(403);
   expect((await session("/v1/rpc", "POST", { method: "create", args: [{}] })).status).toBe(403);
+  expect((await session("/v1/rpc", "POST", { method: "imageFromRuntime", args: [rt, "app"] })).status).toBe(403);
   // writes without the panel header, or from another origin, are refused
   expect((await session("/v1/rpc", "POST", { method: "suspend", args: [rt] }, {})).status).toBe(403);
   expect((await session("/v1/rpc", "POST", { method: "suspend", args: [rt] }, { "x-runo-panel": "1", origin: "https://evil.example" })).status).toBe(403);
@@ -143,6 +144,12 @@ test("a browser session runs the panel but cannot reach a VM, skip CSRF, or act 
   expect((await request("/v1/rpc", "stranger", { method: "ensurePorts", args: [[80, 443]] })).status).toBe(200);
   expect((await request("/v1/rpc", "stranger", { method: "ensurePorts", args: [[5432]] })).status).toBe(403);
   expect((await request("/v1/rpc", "boss", { method: "ensurePorts", args: [[5432]] })).status).toBe(200);
+  for (const user of ["ci", "qa"])
+    expect((await request("/v1/rpc", user, { method: "imageFromRuntime", args: [rt, "app"] })).status).toBe(403);
+  // An admin passes authorization and reaches the AWS provider's unsupported-operation check.
+  const image = await request("/v1/rpc", "boss", { method: "imageFromRuntime", args: [rt, "app"] });
+  expect(image.status).toBe(400);
+  expect(await image.json()).toMatchObject({ error: { message: "imageFromRuntime is not available on the aws provider" } });
   // configuration is admin-only
   expect((await session("/v1/policies", "PUT", { max_disk_gb: 1 })).status).toBe(403);
   expect((await session("/v1/users")).status).toBe(403);

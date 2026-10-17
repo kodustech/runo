@@ -55,6 +55,15 @@ function labelValue(raw: string): string {
   return raw.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").slice(0, 63);
 }
 
+function instanceMetadata(instance: any): Map<string, string> {
+  return new Map((instance?.metadata?.items ?? []).map((item: any) => [item.key, item.value]));
+}
+
+function isNameConflict(error: unknown): boolean {
+  return error instanceof GceError &&
+    (error.status === 409 || /already_?exists|resource_already_exists/i.test(error.reason ?? ""));
+}
+
 /** Image family of a repo's base image: one per repo and install. */
 export function imageFamilyFor(repo: string): string {
   const slug = repo.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "repo";
@@ -310,10 +319,7 @@ export class GceProvider extends SshVmProvider implements RuntimeProvider {
 
   // ---------- lifecycle ----------
 
-  private mapInstance(i: any): Runtime {
-    const meta: Record<string, string> = Object.fromEntries(
-      (i?.metadata?.items ?? []).map((m: any) => [m.key, m.value]),
-    );
+  private mapInstance(i: any, meta = instanceMetadata(i)): Runtime {
     return {
       id: i.name,
       ip: i.networkInterfaces?.[0]?.accessConfigs?.[0]?.natIP ?? null,
@@ -321,10 +327,10 @@ export class GceProvider extends SshVmProvider implements RuntimeProvider {
       gceStatus: i.status,
       instanceType: String(i.machineType ?? "").split("/").pop(),
       launchedAt: i.lastStartTimestamp ?? i.creationTimestamp,
-      name: meta["runo-env-name"] ?? i.name,
+      name: meta.get("runo-env-name") ?? i.name,
       lifecycle: i.scheduling?.provisioningModel === "SPOT" ? "spot" : undefined,
       bootDisk: (i.disks ?? []).find((d: any) => d.boot)?.source,
-      ...(meta["runo-profile"] ? { profile: meta["runo-profile"] } : {}),
+      ...(meta.get("runo-profile") ? { profile: meta.get("runo-profile") } : {}),
     };
   }
 
@@ -475,25 +481,26 @@ export class GceProvider extends SshVmProvider implements RuntimeProvider {
           await launch(true);
           log.dim("SPOT instance (preemption = stop) — cheaper than on-demand");
         } catch (e: any) {
-          if (e instanceof GceError && e.status === 403) this.explain(e);
+          if (isNameConflict(e) || !/RESOURCE_POOL_EXHAUSTED|STOCKOUT/i.test(`${e?.reason} ${e?.message}`)) throw e;
           log.warn(`spot unavailable right now (${e?.reason || e?.message}) — falling back to on-demand`);
-          await this.deleteQuietly(name);
           await launch(false);
         }
       } else {
         await launch(false);
       }
     } catch (e: any) {
-      await this.deleteQuietly(name);
+      // A rejected or failed insert does not establish ownership of this
+      // name. It may identify another user's VM, so never delete it here.
+      if (isNameConflict(e))
+        throw new RunoError(`Environment name "${name}" already exists in Compute Engine`, "Choose a different environment name");
       this.explain(e);
     }
     log.dim(`instance ${name} created (${machineType}, ${spec.diskGb}GB ${this.diskType}, ${this.zone})`);
     try {
       return await this.waitForState(name, "running", 5 * 60_000, true);
     } catch (e) {
-      // the caller never learns this name when create fails, so nothing would
-      // ever delete it: an instance that did not come up must not outlive
-      // the error that reported it
+      // Only a successful insert operation establishes that this request
+      // created the VM. A readiness failure may clean up that VM.
       log.warn(`instance ${name} did not come up — deleting it so it cannot leak`);
       await this.deleteQuietly(name);
       throw e;
@@ -678,11 +685,11 @@ export class GceProvider extends SshVmProvider implements RuntimeProvider {
   }
 
   async listByBranch(repo: string, branch: string): Promise<Runtime[]> {
-    const meta = (i: any, key: string) => (i.metadata?.items ?? []).find((m: any) => m.key === key)?.value;
     return (await this.listRaw())
-      .filter((i) => meta(i, "runo-repo") === repo && meta(i, "runo-branch") === branch)
-      .sort((a, b) => String(b.creationTimestamp ?? "").localeCompare(String(a.creationTimestamp ?? "")))
-      .map((i) => this.mapInstance(i));
+      .map((instance) => ({ instance, meta: instanceMetadata(instance) }))
+      .filter(({ meta }) => meta.get("runo-repo") === repo && meta.get("runo-branch") === branch)
+      .sort((a, b) => String(b.instance.creationTimestamp ?? "").localeCompare(String(a.instance.creationTimestamp ?? "")))
+      .map(({ instance, meta }) => this.mapInstance(instance, meta));
   }
 
   async listManaged(): Promise<Runtime[]> {
