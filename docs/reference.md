@@ -7,7 +7,7 @@ Detailed configuration for Runo. Start with the [quickstart](quickstart.md) for 
 | Var | Default | Effect |
 | --- | --- | --- |
 | `RUNO_HOME` | `~/.runo` | state root (registry, worktrees, SSH keys). Parallel installs MUST use distinct RUNO_HOMEs |
-| `RUNO_PROVIDER` | `aws` | cloud for direct mode and for runo-server: `aws` or `gce` (see "Google Compute Engine") |
+| `RUNO_PROVIDER` | `aws` | cloud for direct mode and for runo-server: `aws` or `gce` (alpha, see "Google Compute Engine") |
 | `RUNO_AWS_REGION` | `sa-east-1` | EC2 region (compare current AWS prices for your region) |
 | `RUNO_DEBUG` | : | `1` prints stack traces |
 | `RUNO_RECIPE` | `.kodus/workspace.yaml` | which recipe to read (same as `--recipe`) : one repo can describe a dev box AND a PR preview |
@@ -294,6 +294,10 @@ runo up --here
   `runo:home-hash` tag); everything tagged `runo:managed=true`.
 
 ## Google Compute Engine (`RUNO_PROVIDER=gce`)
+
+> **Alpha.** Covered by unit tests against a mocked Compute Engine API; it has
+> not yet run end to end on a real project. Expect rough edges, use a project
+> of its own, and report what breaks.
 
 The same recipes run on Compute Engine. Set `RUNO_PROVIDER=gce` where VMs are
 created: the control plane (developers, CI and agents keep talking to it with
