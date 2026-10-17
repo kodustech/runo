@@ -1,11 +1,11 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-type Call = (route: string, user: string, body?: unknown) => Promise<Response>;
+type Call = (route: string, user: string, body?: unknown, signal?: AbortSignal) => Promise<Response>;
 
-async function withServer(run: (request: Call, port: string) => Promise<void>, maxInstances = "5"): Promise<void> {
+async function withServer(run: (request: Call, port: string, dir: string) => Promise<void>, maxInstances = "5"): Promise<void> {
   const dir = mkdtempSync(path.join(tmpdir(), "runo-access-test-"));
   writeFileSync(path.join(dir, "server-envs.json"), JSON.stringify({ preview: {
     envName: "preview", owner: "ci", members: ["qa"], instanceId: "i-preview",
@@ -22,6 +22,8 @@ async function withServer(run: (request: Call, port: string) => Promise<void>, m
         super(options);
         this.ensureKeyPair = async () => {};
         this.ensureSecurityGroup = async () => "sg-test";
+        this.canonicalAmi = async () => ({ amiId: "ami-test", rootDevice: "/dev/sda1" });
+        this.waitReady = async () => {};
         this.claimFromPool = async () => null;
         this.launchInstance = async (options) => {
           await Bun.sleep(40);
@@ -32,10 +34,25 @@ async function withServer(run: (request: Call, port: string) => Promise<void>, m
         };
         this.waitForState = async (id) => fleet.find((rt) => rt.id === id);
         this.ec2 = { send: async (cmd) => {
-          if (cmd.constructor.name !== "StartInstancesCommand") throw new Error("unexpected cloud command: " + cmd.constructor.name);
-          await Bun.sleep(40);
-          fleet.find((rt) => rt.id === cmd.input.InstanceIds[0]).state = "running";
-          return {};
+          switch (cmd.constructor.name) {
+            case "RunInstancesCommand":
+              fleet.push({ id: "i-bake", ip: "192.0.2.12", state: "running" });
+              return { Instances: [{ InstanceId: "i-bake" }] };
+            case "StartInstancesCommand":
+              await Bun.sleep(40);
+              fleet.find((rt) => rt.id === cmd.input.InstanceIds[0]).state = "running";
+              return {};
+            case "StopInstancesCommand":
+            case "TerminateInstancesCommand":
+              fleet.find((rt) => rt.id === cmd.input.InstanceIds[0]).state = cmd.constructor.name === "StopInstancesCommand" ? "stopped" : "terminated";
+              return {};
+            case "CreateImageCommand":
+              await Bun.write(process.env.RUNO_HOME + "/bake-image-pending", "1");
+              while (!await Bun.file(process.env.RUNO_HOME + "/bake-image-release").exists()) await Bun.sleep(5);
+              return { ImageId: "ami-baked" };
+            case "DescribeImagesCommand": return { Images: [{ State: "available" }] };
+            default: throw new Error("unexpected cloud command: " + cmd.constructor.name);
+          }
         }};
       }
       async status(rt) { return fleet.find((entry) => entry.id === rt.id) ?? { id: rt.id, ip: null, state: "terminated" }; }
@@ -66,12 +83,13 @@ async function withServer(run: (request: Call, port: string) => Promise<void>, m
       port = output.match(/listening on :(\d+)/)?.[1];
     }
     reader.releaseLock();
-    const request: Call = (route, user, body) => fetch(`http://localhost:${port}${route}`, {
+    const request: Call = (route, user, body, signal) => fetch(`http://localhost:${port}${route}`, {
       method: body === undefined ? "GET" : "POST",
       headers: { authorization: `Bearer ${user}-token`, "content-type": "application/json" },
       body: body === undefined ? undefined : JSON.stringify(body),
+      signal,
     });
-    await run(request, port);
+    await run(request, port, dir);
   } finally {
     proc.kill();
     await proc.exited;
@@ -252,4 +270,27 @@ test("a failed cloud launch releases capacity for the next request", () => withS
   }] });
   expect((await create("cloud-failure")).status).toBe(500);
   expect((await create("after-failure")).status).toBe(200);
+}), 15000);
+
+test("image generation does not block create or resume after the bake VM is accounted for", () => withServer(async (request, port, dir) => {
+  expect((await request("/v1/rpc", "ci", { method: "suspend", args: [rt] })).status).toBe(200);
+  expect((await fetch(`http://localhost:${port}/v1/policies`, {
+    method: "PUT", headers: { authorization: "Bearer boss-token" }, body: JSON.stringify({ max_running_total: 2 }),
+  })).status).toBe(200);
+  let finished = false;
+  const baking = request("/v1/rpc", "boss", { method: "prepareBootImage" }).then((response) => { finished = true; return response; });
+  try {
+    const deadline = Date.now() + 3000;
+    while (!existsSync(path.join(dir, "bake-image-pending")) && Date.now() < deadline) await Bun.sleep(5);
+    expect(existsSync(path.join(dir, "bake-image-pending"))).toBe(true);
+    const resumed = await request("/v1/rpc", "ci", { method: "resume", args: [rt] }, AbortSignal.timeout(2000));
+    expect(resumed.status).toBe(200);
+    expect((await request("/v1/rpc", "ci", { method: "create", args: [{
+      envName: "while-baking", slug: "while-baking", branch: "while-baking", repo: "app", instanceType: "t3.micro", diskGb: 20,
+    }] }, AbortSignal.timeout(2000))).status).toBe(200);
+    expect(finished).toBe(false);
+  } finally {
+    writeFileSync(path.join(dir, "bake-image-release"), "1");
+    expect((await baking).status).toBe(200);
+  }
 }), 15000);

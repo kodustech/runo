@@ -878,7 +878,7 @@ export class Ec2Provider implements RuntimeProvider {
     instanceType: string;
     diskGb: number;
     prepare: (rt: Runtime) => Promise<void>;
-  }): Promise<string> {
+  }, onRunning?: () => void): Promise<string> {
     await this.guardrail();
     await this.ensureKeyPair();
     const sgId = await this.ensureSecurityGroup();
@@ -925,6 +925,9 @@ export class Ec2Provider implements RuntimeProvider {
     const id = res.Instances![0]!.InstanceId!;
     try {
       const rt = await this.waitForState(id, "running", 5 * 60_000, true);
+      // The temporary VM now occupies a visible running slot. The server can
+      // admit other work while setup and image generation continue.
+      onRunning?.();
       await this.waitReady(rt, { firstBoot: true });
       const check = await this.exec(
         rt,

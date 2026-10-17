@@ -141,20 +141,20 @@ async function handleRpc(who: Identity, body: any): Promise<Response> {
   if (!CAPACITY_RPC.has(method)) return dispatchRpc(who, method, args);
 
   // This control plane is a single process. Hold admission until the cloud
-  // operation and registry update finish, so simultaneous creates/resumes
-  // cannot both spend the same owner/org slot. Failed operations release it too.
+  // state is accounted for, so simultaneous requests cannot spend the same
+  // owner/org slot. Failed operations release it too.
   const previous = capacityTurn;
   let release!: () => void;
   capacityTurn = new Promise<void>((resolve) => { release = resolve; });
   await previous;
   try {
-    return await dispatchRpc(who, method, args);
+    return await dispatchRpc(who, method, args, release);
   } finally {
     release();
   }
 }
 
-async function dispatchRpc(who: Identity, method: string, args: any[]): Promise<Response> {
+async function dispatchRpc(who: Identity, method: string, args: any[], releaseCapacity?: () => void): Promise<Response> {
   const user = who.user;
   const envsBefore = Object.values(loadEnvs());
   let target: ServerEnv | undefined;
@@ -211,7 +211,11 @@ async function dispatchRpc(who: Identity, method: string, args: any[]): Promise<
   }
 
   const startedAt = Date.now();
-  const result = await (provider as any)[method](...args);
+  // Once the bake VM is running it is included in fleet counts. Its remaining
+  // setup and image generation must not hold up other users' creates/resumes.
+  const result = method === "prepareBootImage"
+    ? await provider.prepareBootImage(args[0], releaseCapacity)
+    : await (provider as any)[method](...args);
 
   // bookkeeping for the platform view
   if (method === "suspend" || method === "resume") {
