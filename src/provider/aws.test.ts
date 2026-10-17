@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { DescribeInstancesCommand, TerminateInstancesCommand } from "@aws-sdk/client-ec2";
+import { DescribeInstancesCommand, RunInstancesCommand, TerminateInstancesCommand } from "@aws-sdk/client-ec2";
 import { Ec2Provider } from "./aws";
 import { MAX_INSTANCES } from "../config";
 
@@ -47,6 +47,73 @@ function capacityProvider(states: string[], limit?: () => number | undefined) {
 }
 
 const capacitySpec = { envName: "capacity", slug: "capacity", instanceType: "t3.medium", diskGb: 20, repo: "app", branch: "capacity" };
+
+function launchProvider(send: (cmd: RunInstancesCommand) => Promise<any>) {
+  const p = providerWith(async (cmd) => {
+    if (!(cmd instanceof RunInstancesCommand)) throw new Error(`unexpected ${cmd.constructor.name}`);
+    return send(cmd);
+  });
+  p.listManaged = async () => [];
+  (p as any).ensureKeyPair = async () => {};
+  (p as any).ensureSecurityGroup = async () => "sg-test";
+  (p as any).claimFromPool = async () => null;
+  (p as any).waitForState = async (id: string) => ({ id, state: "running", ip: "192.0.2.1" });
+  return p;
+}
+
+for (const code of ["InvalidAMIID.NotFound", "InvalidAMIID.Unavailable"]) {
+  for (const spot of [false, true]) {
+    test(`a ${spot ? "spot" : "on-demand"} create resolves its image again after ${code}`, async () => {
+      const launches: RunInstancesCommand["input"][] = [];
+      let resolutions = 0;
+      const p = launchProvider(async (cmd) => {
+        launches.push(cmd.input);
+        if (cmd.input.ImageId === "ami-retired") throw Object.assign(new Error("image retired"), { name: code });
+        return { Instances: [{ InstanceId: "i-new" }] };
+      });
+      (p as any).resolveAmi = async (repo: string) => {
+        expect(repo).toBe("app");
+        return ++resolutions === 1
+          ? { amiId: "ami-retired", rootDevice: "/dev/old", baked: true }
+          : { amiId: "ami-current", rootDevice: "/dev/current", baked: false };
+      };
+      expect(await p.create({ ...capacitySpec, spot })).toMatchObject({ id: "i-new" });
+      expect(resolutions).toBe(2);
+      expect(launches.map((input) => input.ImageId)).toEqual(["ami-retired", "ami-current"]);
+      expect(launches[0].UserData).toBeUndefined();
+      expect(launches[1].UserData).toBeTruthy();
+      expect(launches[1].BlockDeviceMappings?.[0]?.DeviceName).toBe("/dev/current");
+    });
+  }
+}
+
+test("retired-image recovery is bounded when the replacement also disappears", async () => {
+  let resolutions = 0;
+  let launches = 0;
+  const p = launchProvider(async () => {
+    launches++;
+    throw Object.assign(new Error("image retired"), { name: "InvalidAMIID.Unavailable" });
+  });
+  (p as any).resolveAmi = async () => ({ amiId: `ami-${++resolutions}`, rootDevice: "/dev/sda1", baked: true });
+  await expect(p.create(capacitySpec)).rejects.toThrow("image retired");
+  expect(resolutions).toBe(2);
+  expect(launches).toBe(2);
+});
+
+test("a missing canonical image and permission errors do not trigger image recovery", async () => {
+  for (const [baked, code, message] of [[false, "InvalidAMIID.NotFound", "image missing"], [true, "UnauthorizedOperation", "no permission"]] as const) {
+    let resolutions = 0;
+    let launches = 0;
+    const p = launchProvider(async () => {
+      launches++;
+      throw Object.assign(new Error(message), { name: code });
+    });
+    (p as any).resolveAmi = async () => { resolutions++; return { amiId: "ami-selected", rootDevice: "/dev/sda1", baked }; };
+    await expect(p.create(capacitySpec)).rejects.toThrow(message);
+    expect(resolutions).toBe(1);
+    expect(launches).toBe(1);
+  }
+});
 
 test("direct AWS CLI retains its configured instance guardrail", async () => {
   const { p, launches } = capacityProvider(Array(MAX_INSTANCES).fill("running"));

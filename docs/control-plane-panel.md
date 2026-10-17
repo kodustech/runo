@@ -89,7 +89,7 @@ running before and after is counted as running throughout.
   atomically; hand edits still work and still hot-reload. The organization
   running limit is the server's only fleet ceiling, including resumed machines,
   pool provisioning and image builds. Empty means unlimited. The server ignores
-  `RUNO_MAX_INSTANCES`; that setting applies only to direct AWS CLI use.
+  `RUNO_MAX_INSTANCES`; that setting applies only to direct AWS/GCE CLI use.
   Capacity changes are admitted one at a time until cloud state and registry
   updates account for their quota slot. Image preparation releases admission
   once its temporary VM is running, before setup and image generation.

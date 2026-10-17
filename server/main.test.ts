@@ -67,7 +67,7 @@ async function withServer(run: (request: Call, port: string, dir: string) => Pro
     await import(${JSON.stringify(new URL("./main.ts", import.meta.url).pathname)});
   `;
   const proc = Bun.spawn([process.execPath, "-e", source], {
-    env: { ...process.env, RUNO_HOME: dir, RUNO_MAX_INSTANCES: maxInstances, RUNO_SERVER_PORT: "0", RUNO_INGRESS_DOMAIN: "", RUNO_PUBLIC_URL: "",
+    env: { ...process.env, RUNO_PROVIDER: "aws", RUNO_HOME: dir, RUNO_MAX_INSTANCES: maxInstances, RUNO_SERVER_PORT: "0", RUNO_INGRESS_DOMAIN: "", RUNO_PUBLIC_URL: "",
       RUNO_GITHUB_CLIENT_ID: "", RUNO_GITHUB_CLIENT_SECRET: "", RUNO_SERVER_ADMINS: "boss",
       RUNO_SERVER_TOKENS: "ci:ci-token,qa:qa-token,stranger:stranger-token,boss:boss-token" },
     stdout: "pipe", stderr: "pipe",

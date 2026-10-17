@@ -23,6 +23,8 @@ import { AWS_REGION, RUNO_HOME } from "../src/config";
 import { RunoError } from "../src/errors";
 import { log } from "../src/log";
 import { Ec2Provider } from "../src/provider/aws";
+import { GceProvider } from "../src/provider/gce";
+import { defaultProviderName } from "../src/provider";
 import type { CreateSpec, ExecOpts, Runtime } from "../src/provider/types";
 import { DEFAULT_PUBLIC_PORTS, enforceCreate, enforceRunningLimits, loadPolicies } from "./policies";
 import { AccessDenied, canAccess, requireAccess } from "./access";
@@ -33,9 +35,12 @@ import { isUp, sampleFleet, vanishedEnvs } from "./usage";
 import { randomBytes } from "node:crypto";
 
 const PORT = Number(process.env.RUNO_SERVER_PORT || argValue("--port") || 7777);
-const provider = new Ec2Provider({
+const providerOptions = {
   runningInstanceLimit: () => loadPolicies().max_running_total,
-});
+};
+// RUNO_PROVIDER picks the cloud this control plane manages (aws | gce)
+const provider = defaultProviderName() === "gce" ? new GceProvider(providerOptions) : new Ec2Provider(providerOptions);
+const REGION = provider instanceof GceProvider ? provider.region : AWS_REGION;
 
 // ---------- auth ----------
 
@@ -128,6 +133,7 @@ const RPC_ALLOWED = new Set([
   "poolScale",
   "prepareBootImage",
   "removeBootImage",
+  "imageFromRuntime",
 ]);
 
 const CAPACITY_RPC = new Set(["create", "resume", "poolScale", "prepareBootImage"]);
@@ -158,13 +164,16 @@ async function dispatchRpc(who: Identity, method: string, args: any[], releaseCa
   const user = who.user;
   const envsBefore = Object.values(loadEnvs());
   let target: ServerEnv | undefined;
-  if (["waitReady", "status", "suspend", "resume", "destroy"].includes(method)) {
+  if (["waitReady", "status", "suspend", "resume", "destroy", "imageFromRuntime"].includes(method)) {
     // admins manage any machine's lifecycle (cost control) but waitReady execs on the VM
     target = requireAccess(user, args[0]?.id, envsBefore, method !== "status", who.admin && method !== "waitReady");
     args[0] = await provider.status({ id: target.instanceId, ip: null, state: "unknown" });
   }
-  if (["poolScale", "prepareBootImage", "removeBootImage"].includes(method) && !who.admin)
+  // a repo's base image is what every new env of that repo boots from
+  if (["poolScale", "prepareBootImage", "removeBootImage", "imageFromRuntime"].includes(method) && !who.admin)
     throw new AccessDenied("This operation requires an admin");
+  if (typeof (provider as any)[method] !== "function")
+    throw new RunoError(`${method} is not available on the ${provider.name} provider`);
   // the security group is shared by the whole fleet: users open only what policy lists
   if (method === "ensurePorts" && !who.admin) {
     const allowed = loadPolicies().allowed_public_ports ?? DEFAULT_PUBLIC_PORTS;
@@ -213,7 +222,7 @@ async function dispatchRpc(who: Identity, method: string, args: any[], releaseCa
   const startedAt = Date.now();
   // Once the bake VM is running it is included in fleet counts. Its remaining
   // setup and image generation must not hold up other users' creates/resumes.
-  const result = method === "prepareBootImage"
+  const result = method === "prepareBootImage" && provider instanceof Ec2Provider
     ? await provider.prepareBootImage(args[0], releaseCapacity)
     : await (provider as any)[method](...args);
 
@@ -223,6 +232,8 @@ async function dispatchRpc(who: Identity, method: string, args: any[], releaseCa
     void sampleNow();
   }
   if (method === "poolScale") store.addEvent({ actor: user, action: "pool.scale", detail: { target: args[0] } });
+  if (method === "imageFromRuntime")
+    store.addEvent({ actor: user, action: "image.bake", envName: target!.envName, instanceId: target!.instanceId, detail: { image: result } });
   if (method === "ensurePorts") store.addEvent({ actor: user, action: "ports.open", detail: { ports: args[0] } });
   if (method === "create") {
     const spec = args[0];
@@ -536,7 +547,9 @@ interface TtyData {
   proc: ReturnType<typeof Bun.spawn>;
 }
 
-if (process.env.RUNO_EXPECTED_AWS_ARN || process.env.RUNO_EXPECTED_AWS_REGION)
+// Compute Engine always checks project access before listening; AWS only
+// when the deployment pins an identity.
+if (provider instanceof GceProvider || process.env.RUNO_EXPECTED_AWS_ARN || process.env.RUNO_EXPECTED_AWS_REGION)
   await provider.preflight();
 
 const server = Bun.serve<TtyData>({
@@ -585,7 +598,7 @@ const server = Bun.serve<TtyData>({
     if (url.pathname === "/v1/health" && req.method === "GET") return json({ ok: true, name: "runo-server", user });
 
     try {
-      const panel = await handlePanelApi({ store, auth, provider, region: AWS_REGION, ingressDomain: INGRESS_DOMAIN }, req, url, who);
+      const panel = await handlePanelApi({ store, auth, provider, region: REGION, ingressDomain: INGRESS_DOMAIN }, req, url, who);
       if (panel) return panel;
       if (url.pathname === "/v1/rpc" && req.method === "POST")
         return await handleRpc(who, await req.json());
