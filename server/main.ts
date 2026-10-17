@@ -26,7 +26,7 @@ import { Ec2Provider } from "../src/provider/aws";
 import { GceProvider } from "../src/provider/gce";
 import { defaultProviderName } from "../src/provider";
 import type { CreateSpec, ExecOpts, Runtime } from "../src/provider/types";
-import { DEFAULT_PUBLIC_PORTS, enforceCreate, loadPolicies } from "./policies";
+import { DEFAULT_PUBLIC_PORTS, enforceCreate, enforceRunningLimits, loadPolicies } from "./policies";
 import { AccessDenied, canAccess, requireAccess } from "./access";
 import { Auth, authConfigFromEnv, ReauthRequired, readCookie, safeEqual, sessionMayCall, SESSION_RPC, Throttle, type Identity } from "./auth";
 import { handlePanelApi } from "./panelApi";
@@ -35,8 +35,11 @@ import { isUp, sampleFleet, vanishedEnvs } from "./usage";
 import { randomBytes } from "node:crypto";
 
 const PORT = Number(process.env.RUNO_SERVER_PORT || argValue("--port") || 7777);
+const providerOptions = {
+  runningInstanceLimit: () => loadPolicies().max_running_total,
+};
 // RUNO_PROVIDER picks the cloud this control plane manages (aws | gce)
-const provider = defaultProviderName() === "gce" ? new GceProvider() : new Ec2Provider();
+const provider = defaultProviderName() === "gce" ? new GceProvider(providerOptions) : new Ec2Provider(providerOptions);
 const REGION = provider instanceof GceProvider ? provider.region : AWS_REGION;
 
 // ---------- auth ----------
@@ -133,12 +136,32 @@ const RPC_ALLOWED = new Set([
   "imageFromRuntime",
 ]);
 
+const CAPACITY_RPC = new Set(["create", "resume", "poolScale", "prepareBootImage", "imageFromRuntime"]);
+let capacityTurn = Promise.resolve();
+
 async function handleRpc(who: Identity, body: any): Promise<Response> {
-  const user = who.user;
   const { method, args = [] } = body;
   if (!RPC_ALLOWED.has(method)) return json({ error: { message: `unknown method: ${method}` } }, 400);
   if (who.via === "session" && !SESSION_RPC.has(method))
     throw new AccessDenied("This operation needs a CLI token, not a browser session");
+  if (!CAPACITY_RPC.has(method)) return dispatchRpc(who, method, args);
+
+  // This control plane is a single process. Hold admission until the cloud
+  // state is accounted for, so simultaneous requests cannot spend the same
+  // owner/org slot. Failed operations release it too.
+  const previous = capacityTurn;
+  let release!: () => void;
+  capacityTurn = new Promise<void>((resolve) => { release = resolve; });
+  await previous;
+  try {
+    return await dispatchRpc(who, method, args, release);
+  } finally {
+    release();
+  }
+}
+
+async function dispatchRpc(who: Identity, method: string, args: any[], releaseCapacity?: () => void): Promise<Response> {
+  const user = who.user;
   const envsBefore = Object.values(loadEnvs());
   let target: ServerEnv | undefined;
   if (["waitReady", "status", "suspend", "resume", "destroy", "imageFromRuntime"].includes(method)) {
@@ -183,8 +206,28 @@ async function handleRpc(who: Identity, body: any): Promise<Response> {
     enforceCreate(pol, spec, { user, userRunningCount, runningTotal: up.size });
   }
 
+  if ((method === "resume" && !isUp(args[0].state)) ||
+      (method === "imageFromRuntime" && args[0].gceStatus === "SUSPENDED")) {
+    const pol = loadPolicies();
+    if (pol.max_envs_per_user !== undefined || pol.max_running_total !== undefined) {
+      const up = new Set((await provider.listManaged()).filter((m) => isUp(m.state)).map((m) => m.id));
+      const owner = target!.owner;
+      enforceRunningLimits(pol, {
+        user: owner,
+        userRunningCount: envsBefore.filter((e) => e.owner === owner && up.has(e.instanceId)).length,
+        runningTotal: up.size,
+      });
+    }
+  }
+
   const startedAt = Date.now();
-  const result = await (provider as any)[method](...args);
+  // Once the bake VM is running it is included in fleet counts. Its remaining
+  // setup and image generation must not hold up other users' creates/resumes.
+  const result = method === "prepareBootImage" && provider instanceof Ec2Provider
+    ? await provider.prepareBootImage(args[0], releaseCapacity)
+    : method === "imageFromRuntime" && provider instanceof GceProvider
+    ? await provider.imageFromRuntime(args[0], args[1], releaseCapacity)
+    : await (provider as any)[method](...args);
 
   // bookkeeping for the platform view
   if (method === "suspend" || method === "resume") {

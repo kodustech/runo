@@ -46,6 +46,19 @@ function errCode(e: any): string {
   return e?.name ?? e?.Code ?? "";
 }
 
+function isRetiredImageError(e: unknown): boolean {
+  return ["InvalidAMIID.NotFound", "InvalidAMIID.Unavailable"].includes(errCode(e));
+}
+
+interface InstanceLaunchOptions {
+  instanceType: string;
+  diskGb: number;
+  tags: Tag[];
+  sgId: string;
+  spot?: boolean;
+  repo?: string;
+}
+
 export class Ec2Provider extends SshVmProvider implements RuntimeProvider {
   readonly name = "aws";
   protected readonly firewallHint = "security group";
@@ -54,6 +67,12 @@ export class Ec2Provider extends SshVmProvider implements RuntimeProvider {
   private sts = new STSClient({ region: AWS_REGION });
   private sgIdCache?: string;
 
+  constructor(private readonly options: {
+    /** Server: hot-reloaded organization policy; undefined means unlimited. */
+    runningInstanceLimit?: () => number | undefined;
+  } = {}) {
+    super();
+  }
   private get sgName(): string {
     return `runo-${HASH6}`;
   }
@@ -260,12 +279,16 @@ export class Ec2Provider extends SshVmProvider implements RuntimeProvider {
 
   /** Cost guardrail: only counts RUNNING instances (stopped ones cost only EBS). */
   private async guardrail(): Promise<void> {
+    const maxInstances = this.options.runningInstanceLimit
+      ? this.options.runningInstanceLimit()
+      : MAX_INSTANCES;
+    if (maxInstances === undefined) return;
     const active = (await this.listManaged()).filter(
       (m) => m.state === "running" || m.state === "pending",
     );
-    if (active.length >= MAX_INSTANCES)
+    if (active.length >= maxInstances)
       throw new RunoError(
-        `Cost guardrail: ${active.length} runo instances running (max ${MAX_INSTANCES}): ${active
+        `Cost guardrail: ${active.length} runo instances running (max ${maxInstances}): ${active
           .map((m) => m.name ?? m.id)
           .join(", ")}`,
         "Suspend/destroy environments (`runo ls`, `runo suspend`, `runo destroy`)",
@@ -277,15 +300,23 @@ export class Ec2Provider extends SshVmProvider implements RuntimeProvider {
    * type/AMI does not support it, relaunches without hibernation (graceful
    * fallback).
    */
-  private async launchInstance(opts: {
-    instanceType: string;
-    diskGb: number;
-    tags: Tag[];
-    sgId: string;
-    spot?: boolean;
-    repo?: string;
-  }): Promise<string> {
-    const { amiId, rootDevice, baked } = await this.resolveAmi(opts.repo);
+  private async launchInstance(opts: InstanceLaunchOptions, retryRetiredImage = true): Promise<string> {
+    const image = await this.resolveAmi(opts.repo);
+    try {
+      return await this.launchResolvedInstance(opts, image);
+    } catch (e) {
+      if (!retryRetiredImage || !image.baked || !isRetiredImageError(e)) throw e;
+      // A concurrent bake can retire an AMI after selection. Resolve again
+      // once, including its disk mapping and cloud-init requirements.
+      log.warn(`baked image ${image.amiId} was retired during launch — resolving the current image`);
+      return this.launchInstance(opts, false);
+    }
+  }
+
+  private async launchResolvedInstance(
+    opts: InstanceLaunchOptions,
+    { amiId, rootDevice, baked }: { amiId: string; rootDevice: string; baked: boolean },
+  ): Promise<string> {
     if (baked) log.dim(`using baked image ${amiId} (runo bake) — fast boot, no heavy cloud-init`);
     const cloudInitPath = new URL("../../image/cloud-init.yaml", import.meta.url).pathname;
     const userData = baked
@@ -350,6 +381,8 @@ export class Ec2Provider extends SshVmProvider implements RuntimeProvider {
 
     const explainOrThrow = (e: any): void => {
       const code = errCode(e);
+      // A different launch mode cannot make a retired image launchable.
+      if (isRetiredImageError(e)) throw e;
       if (code === "VcpuLimitExceeded")
         throw new RunoError(
           "AWS refused the instance: on-demand vCPU quota exceeded (VcpuLimitExceeded)",
@@ -514,6 +547,9 @@ export class Ec2Provider extends SshVmProvider implements RuntimeProvider {
   }
 
   async resume(rt: Runtime): Promise<Runtime> {
+    if (rt.state === "running") return rt.ip ? rt : this.waitForState(rt.id, "running", 5 * 60_000, true);
+    if (rt.state === "pending") return this.waitForState(rt.id, "running", 5 * 60_000, true);
+    await this.guardrail();
     try {
       await this.ec2.send(new StartInstancesCommand({ InstanceIds: [rt.id] }));
     } catch (e: any) {
@@ -649,7 +685,7 @@ export class Ec2Provider extends SshVmProvider implements RuntimeProvider {
     instanceType: string;
     diskGb: number;
     prepare: (rt: Runtime) => Promise<void>;
-  }): Promise<string> {
+  }, onRunning?: () => void): Promise<string> {
     await this.guardrail();
     await this.ensureKeyPair();
     const sgId = await this.ensureSecurityGroup();
@@ -696,6 +732,9 @@ export class Ec2Provider extends SshVmProvider implements RuntimeProvider {
     const id = res.Instances![0]!.InstanceId!;
     try {
       const rt = await this.waitForState(id, "running", 5 * 60_000, true);
+      // The temporary VM now occupies a visible running slot. The server can
+      // admit other work while setup and image generation continue.
+      onRunning?.();
       await this.waitReady(rt, { firstBoot: true });
       const check = await this.exec(
         rt,

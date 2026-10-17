@@ -319,11 +319,11 @@ const views = {
       <div class="card tablebox"><table><thead><tr><th>login</th><th>source</th><th>role</th><th>last login</th><th></th></tr></thead><tbody>${userRows.join("")}</tbody></table></div></div>`;
 
     const gh = server.github;
-    const serverSection = `<div class="section"><h2>Server <span class="dim small">(read-only — set in the server's environment file)</span></h2>
+    const serverSection = `<div class="section"><h2>Server <span class="dim small">(read-only)</span></h2>
       <div class="card"><dl class="info">
         <dt>region</dt><dd>${esc(server.region)}</dd>
         <dt>expected AWS identity</dt><dd>${esc(server.expectedAwsArn ?? "not pinned")}</dd>
-        <dt>hard instance ceiling</dt><dd>${esc(server.maxInstances)} (RUNO_MAX_INSTANCES)</dd>
+        <dt>running instance limit</dt><dd>${server.maxInstances == null ? "unlimited" : esc(server.maxInstances)} (Policies)</dd>
         <dt>warm pool</dt><dd>${server.pool === null ? "-" : esc(server.pool) + " instances"}</dd>
         <dt>public URL</dt><dd>${esc(server.publicUrl ?? "not set")}</dd>
         <dt>ingress domain</dt><dd>${esc(server.ingressDomain ?? "off")}</dd>

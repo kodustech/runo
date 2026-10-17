@@ -5,11 +5,12 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { GceError, GceProvider, gceCloudInit, imageFamilyFor, instanceNameFor, machineTypeFor, mapState } from "./gce";
+import { MAX_INSTANCES } from "../config";
 
 const done = { status: "DONE", selfLink: "https://compute.googleapis.com/op" };
 
-function providerWith(api: (method: string, path: string, body?: any) => Promise<any>): GceProvider {
-  const p = new GceProvider();
+function providerWith(api: (method: string, path: string, body?: any) => Promise<any>, runningInstanceLimit?: () => number | undefined): GceProvider {
+  const p = new GceProvider(runningInstanceLimit ? { runningInstanceLimit } : {});
   (p as any).api = api;
   (p as any).pollMs = 1;
   (p as any).ensureLocalKey = () => false;
@@ -87,6 +88,87 @@ test("create deletes the instance it launched when it never comes up", async () 
   expect(deleted).toEqual(["runo-abc123-b"]);
 });
 
+for (const spot of [false, true]) {
+  for (const asynchronous of [false, true]) {
+    test(`${spot ? "spot" : "on-demand"} name conflicts preserve an existing VM (${asynchronous ? "operation" : "HTTP"} error)`, async () => {
+      const victimName = "runo-abc123-victim";
+      const deleted: string[] = [];
+      let inserts = 0;
+      const p = providerWith(async (method, route) => {
+        if (method === "GET" && route.includes("/instances?"))
+          return { items: [instance(victimName, { "runo-repo": "someone-elses-repo" })] };
+        if (method === "GET" && route.startsWith("global/firewalls/")) return { allowed: [{ IPProtocol: "tcp", ports: ["22"] }] };
+        if (method === "POST" && route.endsWith("/instances")) {
+          inserts++;
+          if (asynchronous) return { ...done, error: { errors: [{ code: "RESOURCE_ALREADY_EXISTS", message: "name already exists" }] } };
+          throw new GceError(409, "name already exists", "alreadyExists");
+        }
+        if (method === "DELETE") { deleted.push(route); return done; }
+        throw new Error(`unexpected ${method} ${route}`);
+      });
+      const submittedName = "RUNO-ABC123-VICTIM";
+      expect(instanceNameFor(submittedName)).toBe(victimName);
+      await expect(p.create({ ...spec, envName: submittedName, spot })).rejects.toThrow("already exists");
+      expect(inserts).toBe(1);
+      expect(deleted).toEqual([]);
+    });
+  }
+}
+
+test("spot capacity fallback never deletes a VM on a conflicting on-demand insert", async () => {
+  const deleted: string[] = [];
+  let inserts = 0;
+  const p = providerWith(async (method, route) => {
+    if (method === "GET" && route.includes("/instances?")) return { items: [] };
+    if (method === "GET" && route.startsWith("global/firewalls/")) return { allowed: [{ IPProtocol: "tcp", ports: ["22"] }] };
+    if (method === "POST" && route.endsWith("/instances")) {
+      if (++inserts === 1) return { ...done, error: { errors: [{ code: "ZONE_RESOURCE_POOL_EXHAUSTED", message: "spot unavailable" }] } };
+      throw new GceError(409, "another request created this name", "alreadyExists");
+    }
+    if (method === "DELETE") { deleted.push(route); return done; }
+    throw new Error(`unexpected ${method} ${route}`);
+  });
+  await expect(p.create({ ...spec, spot: true })).rejects.toThrow("already exists");
+  expect(inserts).toBe(2);
+  expect(deleted).toEqual([]);
+});
+
+test("spot falls back after capacity exhaustion and cleans up its own failed boot", async () => {
+  const deleted: string[] = [];
+  let inserts = 0;
+  const p = providerWith(async (method, route) => {
+    if (method === "GET" && route.includes("/instances?")) return { items: [] };
+    if (method === "GET" && route.startsWith("global/firewalls/")) return { allowed: [{ IPProtocol: "tcp", ports: ["22"] }] };
+    if (method === "POST" && route.endsWith("/instances")) {
+      if (++inserts === 1) throw new GceError(503, "spot unavailable", "STOCKOUT");
+      return done;
+    }
+    if (method === "GET" && route.includes("/instances/")) throw new GceError(404, "instance gone");
+    if (method === "DELETE") { deleted.push(route); return done; }
+    throw new Error(`unexpected ${method} ${route}`);
+  });
+  await expect(p.create({ ...spec, spot: true })).rejects.toThrow("deleted unexpectedly");
+  expect(inserts).toBe(2);
+  expect(deleted).toEqual(["zones/us-central1-a/instances/runo-abc123-b"]);
+});
+
+for (const status of [403, 500]) {
+  test(`a failed insert (${status}) neither deletes an unowned VM nor retries another mode`, async () => {
+    const deleted: string[] = [];
+    let inserts = 0;
+    const p = providerWith(async (method, route) => {
+      if (method === "GET" && route.includes("/instances?")) return { items: [] };
+      if (method === "GET" && route.startsWith("global/firewalls/")) return { allowed: [{ IPProtocol: "tcp", ports: ["22"] }] };
+      if (method === "POST" && route.endsWith("/instances")) { inserts++; throw new GceError(status, "insert failed"); }
+      if (method === "DELETE") { deleted.push(route); return done; }
+      throw new Error(`unexpected ${method} ${route}`);
+    });
+    await expect(p.create({ ...spec, spot: true })).rejects.toThrow(status === 403 ? "no permission" : "insert failed");
+    expect(inserts).toBe(1);
+    expect(deleted).toEqual([]);
+  });
+}
+
 test("ensurePorts adds only the missing ports to the existing rule, once", async () => {
   const patches: any[] = [];
   let gets = 0;
@@ -134,6 +216,50 @@ test("resume uses `resume` for a suspended instance and `start` for a stopped on
   status = "TERMINATED";
   await p.resume({ id: "runo-abc123-b", ip: null, state: "stopped" });
   expect(verbs).toEqual(["resume", "start"]);
+});
+
+test("GCE resumes use hot-reloaded panel capacity and an empty policy is unlimited", async () => {
+  let limit: number | undefined = 10;
+  let status = "TERMINATED";
+  let starts = 0;
+  const p = providerWith(async (method, route) => {
+    if (method === "GET" && route.includes("/instances?"))
+      return { items: Array.from({ length: 10 }, (_, i) => instance(`active-${i}`, {}, { status: i ? "RUNNING" : "STAGING" })) };
+    if (method === "GET") return instance("stopped", {}, { status });
+    if (method === "POST") { starts++; status = "RUNNING"; return done; }
+    throw new Error(`unexpected ${method} ${route}`);
+  }, () => limit);
+  const rt = { id: "stopped", ip: null, state: "stopped" } as const;
+  await expect(p.resume(rt)).rejects.toThrow("max 10");
+  expect(starts).toBe(0);
+  limit = 11;
+  expect(await p.resume(rt)).toMatchObject({ state: "running" });
+  expect(await p.resume(rt)).toMatchObject({ state: "running" });
+  expect(starts).toBe(1);
+  status = "TERMINATED";
+  limit = undefined;
+  expect(await p.resume(rt)).toMatchObject({ state: "running" });
+  expect(starts).toBe(2);
+});
+
+test("direct GCE retains its local capacity guardrail", async () => {
+  const p = providerWith(async (method, route) => {
+    if (method === "GET" && route.includes("/instances?"))
+      return { items: Array.from({ length: MAX_INSTANCES }, (_, i) => instance(`active-${i}`, {})) };
+    if (method === "GET") return instance("stopped", {}, { status: "TERMINATED" });
+    throw new Error(`unexpected ${method} ${route}`);
+  });
+  await expect(p.resume({ id: "stopped", ip: null, state: "stopped" })).rejects.toThrow(`max ${MAX_INSTANCES}`);
+});
+
+test("imaging a suspended GCE environment cannot bypass the panel running limit", async () => {
+  const p = providerWith(async (method, route) => {
+    if (method === "GET" && route.includes("/instances?"))
+      return { items: Array.from({ length: 10 }, (_, i) => instance(`active-${i}`, {})) };
+    if (method === "GET") return instance("suspended", {}, { status: "SUSPENDED" });
+    throw new Error(`unexpected ${method} ${route}`);
+  }, () => 10);
+  await expect(p.imageFromRuntime({ id: "suspended", ip: null, state: "stopped" }, "app")).rejects.toThrow("max 10");
 });
 
 test("an env of a repo with a base image boots from it, without cloud-init, on a disk at least as large", () => {

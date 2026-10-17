@@ -55,6 +55,15 @@ function labelValue(raw: string): string {
   return raw.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").slice(0, 63);
 }
 
+function instanceMetadata(instance: any): Map<string, string> {
+  return new Map((instance?.metadata?.items ?? []).map((item: any) => [item.key, item.value]));
+}
+
+function isNameConflict(error: unknown): boolean {
+  return error instanceof GceError &&
+    (error.status === 409 || /already_?exists|resource_already_exists/i.test(error.reason ?? ""));
+}
+
 /** Image family of a repo's base image: one per repo and install. */
 export function imageFamilyFor(repo: string): string {
   const slug = repo.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "repo";
@@ -133,6 +142,13 @@ export class GceProvider extends SshVmProvider implements RuntimeProvider {
   private openPorts = new Set<string>();
   /** Poll interval of waitForState; a test shortens it. */
   private pollMs = 5000;
+
+  constructor(private readonly options: {
+    /** Server: hot-reloaded organization policy; undefined means unlimited. */
+    runningInstanceLimit?: () => number | undefined;
+  } = {}) {
+    super();
+  }
 
   /** Network tag on every env VM, and the name of the firewall rule that targets it. */
   private get netTag(): string {
@@ -303,10 +319,7 @@ export class GceProvider extends SshVmProvider implements RuntimeProvider {
 
   // ---------- lifecycle ----------
 
-  private mapInstance(i: any): Runtime {
-    const meta: Record<string, string> = Object.fromEntries(
-      (i?.metadata?.items ?? []).map((m: any) => [m.key, m.value]),
-    );
+  private mapInstance(i: any, meta = instanceMetadata(i)): Runtime {
     return {
       id: i.name,
       ip: i.networkInterfaces?.[0]?.accessConfigs?.[0]?.natIP ?? null,
@@ -314,10 +327,10 @@ export class GceProvider extends SshVmProvider implements RuntimeProvider {
       gceStatus: i.status,
       instanceType: String(i.machineType ?? "").split("/").pop(),
       launchedAt: i.lastStartTimestamp ?? i.creationTimestamp,
-      name: meta["runo-env-name"] ?? i.name,
+      name: meta.get("runo-env-name") ?? i.name,
       lifecycle: i.scheduling?.provisioningModel === "SPOT" ? "spot" : undefined,
       bootDisk: (i.disks ?? []).find((d: any) => d.boot)?.source,
-      ...(meta["runo-profile"] ? { profile: meta["runo-profile"] } : {}),
+      ...(meta.get("runo-profile") ? { profile: meta.get("runo-profile") } : {}),
     };
   }
 
@@ -346,10 +359,14 @@ export class GceProvider extends SshVmProvider implements RuntimeProvider {
 
   /** Cost guardrail: only counts RUNNING instances (stopped ones cost only disk). */
   private async guardrail(): Promise<void> {
+    const maxInstances = this.options.runningInstanceLimit
+      ? this.options.runningInstanceLimit()
+      : MAX_INSTANCES;
+    if (maxInstances === undefined) return;
     const active = (await this.listManaged()).filter((m) => m.state === "running" || m.state === "pending");
-    if (active.length >= MAX_INSTANCES)
+    if (active.length >= maxInstances)
       throw new RunoError(
-        `Cost guardrail: ${active.length} runo instances running (max ${MAX_INSTANCES}): ${active
+        `Cost guardrail: ${active.length} runo instances running (max ${maxInstances}): ${active
           .map((m) => m.name ?? m.id)
           .join(", ")}`,
         "Suspend/destroy environments (`runo ls`, `runo suspend`, `runo destroy`)",
@@ -464,25 +481,26 @@ export class GceProvider extends SshVmProvider implements RuntimeProvider {
           await launch(true);
           log.dim("SPOT instance (preemption = stop) — cheaper than on-demand");
         } catch (e: any) {
-          if (e instanceof GceError && e.status === 403) this.explain(e);
+          if (isNameConflict(e) || !/RESOURCE_POOL_EXHAUSTED|STOCKOUT/i.test(`${e?.reason} ${e?.message}`)) throw e;
           log.warn(`spot unavailable right now (${e?.reason || e?.message}) — falling back to on-demand`);
-          await this.deleteQuietly(name);
           await launch(false);
         }
       } else {
         await launch(false);
       }
     } catch (e: any) {
-      await this.deleteQuietly(name);
+      // A rejected or failed insert does not establish ownership of this
+      // name. It may identify another user's VM, so never delete it here.
+      if (isNameConflict(e))
+        throw new RunoError(`Environment name "${name}" already exists in Compute Engine`, "Choose a different environment name");
       this.explain(e);
     }
     log.dim(`instance ${name} created (${machineType}, ${spec.diskGb}GB ${this.diskType}, ${this.zone})`);
     try {
       return await this.waitForState(name, "running", 5 * 60_000, true);
     } catch (e) {
-      // the caller never learns this name when create fails, so nothing would
-      // ever delete it: an instance that did not come up must not outlive
-      // the error that reported it
+      // Only a successful insert operation establishes that this request
+      // created the VM. A readiness failure may clean up that VM.
       log.warn(`instance ${name} did not come up — deleting it so it cannot leak`);
       await this.deleteQuietly(name);
       throw e;
@@ -520,6 +538,9 @@ export class GceProvider extends SshVmProvider implements RuntimeProvider {
 
   async resume(rt: Runtime): Promise<Runtime> {
     const fresh = await this.describe(rt.id);
+    if (fresh.state === "running") return fresh.ip ? fresh : this.waitForState(rt.id, "running", 5 * 60_000, true);
+    if (fresh.state === "pending") return this.waitForState(rt.id, "running", 5 * 60_000, true);
+    await this.guardrail();
     const verb = fresh.gceStatus === "SUSPENDED" ? "resume" : "start";
     try {
       await this.waitOp(await this.api("POST", `${this.inst(rt.id)}/${verb}`));
@@ -567,14 +588,16 @@ export class GceProvider extends SshVmProvider implements RuntimeProvider {
     }
   }
 
-  async imageFromRuntime(rt: Runtime, repo: string): Promise<string> {
+  async imageFromRuntime(rt: Runtime, repo: string, onRunning?: () => void): Promise<string> {
     let fresh = await this.describe(rt.id);
     if (fresh.state === "terminated") throw new RunoError(`Instance ${rt.id} no longer exists`);
     // the disk has to be quiet: a suspended VM still owns its memory state
     if (fresh.gceStatus === "SUSPENDED") {
-      await this.waitOp(await this.api("POST", `${this.inst(rt.id)}/resume`));
-      fresh = await this.waitForState(rt.id, "running", 5 * 60_000);
+      fresh = await this.resume(fresh);
     }
+    // No further starts occur during imaging; it must not hold admission
+    // through the image operation, which can take up to thirty minutes.
+    onRunning?.();
     if (fresh.state !== "stopped") {
       log.step("stopping the environment to image its disk…");
       await this.waitOp(await this.api("POST", `${this.inst(rt.id)}/stop`));
@@ -662,11 +685,11 @@ export class GceProvider extends SshVmProvider implements RuntimeProvider {
   }
 
   async listByBranch(repo: string, branch: string): Promise<Runtime[]> {
-    const meta = (i: any, key: string) => (i.metadata?.items ?? []).find((m: any) => m.key === key)?.value;
     return (await this.listRaw())
-      .filter((i) => meta(i, "runo-repo") === repo && meta(i, "runo-branch") === branch)
-      .sort((a, b) => String(b.creationTimestamp ?? "").localeCompare(String(a.creationTimestamp ?? "")))
-      .map((i) => this.mapInstance(i));
+      .map((instance) => ({ instance, meta: instanceMetadata(instance) }))
+      .filter(({ meta }) => meta.get("runo-repo") === repo && meta.get("runo-branch") === branch)
+      .sort((a, b) => String(b.instance.creationTimestamp ?? "").localeCompare(String(a.instance.creationTimestamp ?? "")))
+      .map(({ instance, meta }) => this.mapInstance(instance, meta));
   }
 
   async listManaged(): Promise<Runtime[]> {

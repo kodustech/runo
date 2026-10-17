@@ -13,7 +13,7 @@ Detailed configuration for Runo. Start with the [quickstart](quickstart.md) for 
 | `RUNO_RECIPE` | `.kodus/workspace.yaml` | which recipe to read (same as `--recipe`) : one repo can describe a dev box AND a PR preview |
 | `RUNO_PROFILE` | : | env profile (same as `--profile`): one env PER PROFILE of a branch : see "Profiles" |
 | `RUNO_SSH_KEY` | : | private key as a value instead of a file, for machines with no `$RUNO_HOME` (CI) |
-| `RUNO_MAX_INSTANCES` | `3` | ceiling on simultaneous RUNNING instances |
+| `RUNO_MAX_INSTANCES` | `3` | direct AWS CLI only: ceiling on simultaneous RUNNING instances; the server uses the panel's organization policy |
 | `CLOUDFLARE_API_TOKEN` | : | only for `expose.domain` (named tunnels) |
 
 ## Commands
