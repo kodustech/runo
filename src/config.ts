@@ -21,9 +21,9 @@ export const REGISTRY_PATH = path.join(RUNO_HOME, "envs.json");
 export const AGENT_ENV_PATH = path.join(homedir(), ".kodus", "agent.env");
 
 /**
- * Cost guardrail: maximum simultaneous RUNNING instances.
- * A laptop wants a low ceiling; CI running one preview per open pull request
- * needs a different one — RUNO_MAX_INSTANCES moves it deliberately.
+ * Direct AWS CLI cost guardrail: maximum simultaneous RUNNING instances.
+ * The control-plane server supplies its hot-reloaded organization policy
+ * instead; RUNO_MAX_INSTANCES does not override the panel's limit.
  */
 export const MAX_INSTANCES = (() => {
   const raw = process.env.RUNO_MAX_INSTANCES?.trim();

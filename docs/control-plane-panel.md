@@ -86,13 +86,15 @@ running before and after is counted as running throughout.
 ## Settings
 
 - **Policies** — the same `policies.yaml` as before, validated and written
-  atomically; hand edits still work and still hot-reload.
+  atomically; hand edits still work and still hot-reload. The organization
+  running limit is the server's only fleet ceiling, including resumed machines,
+  pool provisioning and image builds. Empty means unlimited. The server ignores
+  `RUNO_MAX_INSTANCES`; that setting applies only to direct AWS CLI use.
 - **Prices** — the table above.
 - **People and service accounts** — promote/demote, disable; create token-only
   identities for CI and agents. A GitHub login can never take over a service
   account's name.
 - **CLI tokens** — everyone mints their own (shown once, stored hashed); admins
   mint for service accounts. `RUNO_SERVER_TOKENS` keeps working for bootstrap.
-- **Server** — region, AWS identity pin, instance ceiling, login allowlist:
-  read-only on purpose. Who may log in and which cloud account is used should
-  not be one panel click away.
+- **Server** — region, AWS identity pin and login allowlist are configured in
+  the server's environment file. The running instance limit mirrors Policies.

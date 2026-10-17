@@ -24,7 +24,7 @@ import { RunoError } from "../src/errors";
 import { log } from "../src/log";
 import { Ec2Provider } from "../src/provider/aws";
 import type { CreateSpec, ExecOpts, Runtime } from "../src/provider/types";
-import { DEFAULT_PUBLIC_PORTS, enforceCreate, loadPolicies } from "./policies";
+import { DEFAULT_PUBLIC_PORTS, enforceCreate, enforceRunningLimits, loadPolicies } from "./policies";
 import { AccessDenied, canAccess, requireAccess } from "./access";
 import { Auth, authConfigFromEnv, ReauthRequired, readCookie, safeEqual, sessionMayCall, SESSION_RPC, Throttle, type Identity } from "./auth";
 import { handlePanelApi } from "./panelApi";
@@ -33,7 +33,9 @@ import { isUp, sampleFleet, vanishedEnvs } from "./usage";
 import { randomBytes } from "node:crypto";
 
 const PORT = Number(process.env.RUNO_SERVER_PORT || argValue("--port") || 7777);
-const provider = new Ec2Provider();
+const provider = new Ec2Provider({
+  runningInstanceLimit: () => loadPolicies().max_running_total,
+});
 
 // ---------- auth ----------
 
@@ -173,6 +175,19 @@ async function handleRpc(who: Identity, body: any): Promise<Response> {
       (e) => e.owner === user && up.has(e.instanceId),
     ).length;
     enforceCreate(pol, spec, { user, userRunningCount, runningTotal: up.size });
+  }
+
+  if (method === "resume" && !isUp(args[0].state)) {
+    const pol = loadPolicies();
+    if (pol.max_envs_per_user !== undefined || pol.max_running_total !== undefined) {
+      const up = new Set((await provider.listManaged()).filter((m) => isUp(m.state)).map((m) => m.id));
+      const owner = target!.owner;
+      enforceRunningLimits(pol, {
+        user: owner,
+        userRunningCount: envsBefore.filter((e) => e.owner === owner && up.has(e.instanceId)).length,
+        runningTotal: up.size,
+      });
+    }
   }
 
   const startedAt = Date.now();

@@ -8,7 +8,7 @@
  */
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { MAX_INSTANCES, RUNO_HOME } from "../src/config";
+import { RUNO_HOME } from "../src/config";
 import { RunoError } from "../src/errors";
 import type { RuntimeProvider } from "../src/provider/types";
 import { AccessDenied } from "./access";
@@ -170,7 +170,7 @@ export async function handlePanelApi(ctx: PanelContext, req: Request, url: URL, 
         home: RUNO_HOME,
         publicUrl: auth.config.publicUrl,
         ingressDomain: ctx.ingressDomain,
-        maxInstances: MAX_INSTANCES,
+        maxInstances: loadPolicies().max_running_total ?? null,
         expectedAwsArn: process.env.RUNO_EXPECTED_AWS_ARN ?? null,
         sessionHours: auth.config.sessionHours,
         github: gh ? { url: gh.url, allowedOrgs: gh.allowedOrgs, allowedUsers: gh.allowedUsers } : null,

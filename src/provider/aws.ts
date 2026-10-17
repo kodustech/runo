@@ -53,6 +53,11 @@ export class Ec2Provider implements RuntimeProvider {
   private sts = new STSClient({ region: AWS_REGION });
   private sgIdCache?: string;
 
+  constructor(private readonly options: {
+    /** Server: hot-reloaded organization policy; undefined means unlimited. */
+    runningInstanceLimit?: () => number | undefined;
+  } = {}) {}
+
   private get keyName(): string {
     return `runo-${HASH6}`;
   }
@@ -312,12 +317,16 @@ export class Ec2Provider implements RuntimeProvider {
 
   /** Cost guardrail: only counts RUNNING instances (stopped ones cost only EBS). */
   private async guardrail(): Promise<void> {
+    const maxInstances = this.options.runningInstanceLimit
+      ? this.options.runningInstanceLimit()
+      : MAX_INSTANCES;
+    if (maxInstances === undefined) return;
     const active = (await this.listManaged()).filter(
       (m) => m.state === "running" || m.state === "pending",
     );
-    if (active.length >= MAX_INSTANCES)
+    if (active.length >= maxInstances)
       throw new RunoError(
-        `Cost guardrail: ${active.length} runo instances running (max ${MAX_INSTANCES}): ${active
+        `Cost guardrail: ${active.length} runo instances running (max ${maxInstances}): ${active
           .map((m) => m.name ?? m.id)
           .join(", ")}`,
         "Suspend/destroy environments (`runo ls`, `runo suspend`, `runo destroy`)",
@@ -566,6 +575,9 @@ export class Ec2Provider implements RuntimeProvider {
   }
 
   async resume(rt: Runtime): Promise<Runtime> {
+    if (rt.state === "running") return rt;
+    if (rt.state === "pending") return this.waitForState(rt.id, "running", 5 * 60_000, true);
+    await this.guardrail();
     try {
       await this.ec2.send(new StartInstancesCommand({ InstanceIds: [rt.id] }));
     } catch (e: any) {

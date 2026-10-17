@@ -102,6 +102,13 @@ export function enforceCreate(
       `Policy: disk ${spec.diskGb}GB exceeds the organization limit (${pol.max_disk_gb}GB)`,
       "Lower limits.disk in the repo's recipe or talk to the platform team.",
     );
+  enforceRunningLimits(pol, ctx);
+}
+
+export function enforceRunningLimits(
+  pol: Policies,
+  ctx: { user: string; userRunningCount: number; runningTotal: number },
+): void {
   if (pol.max_envs_per_user !== undefined && ctx.userRunningCount >= pol.max_envs_per_user)
     throw new RunoError(
       `Policy: you already have ${ctx.userRunningCount} environment(s) running (limit ${pol.max_envs_per_user})`,
