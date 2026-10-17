@@ -171,6 +171,16 @@ test("direct GCE retains its local capacity guardrail", async () => {
   await expect(p.resume({ id: "stopped", ip: null, state: "stopped" })).rejects.toThrow(`max ${MAX_INSTANCES}`);
 });
 
+test("imaging a suspended GCE environment cannot bypass the panel running limit", async () => {
+  const p = providerWith(async (method, route) => {
+    if (method === "GET" && route.includes("/instances?"))
+      return { items: Array.from({ length: 10 }, (_, i) => instance(`active-${i}`, {})) };
+    if (method === "GET") return instance("suspended", {}, { status: "SUSPENDED" });
+    throw new Error(`unexpected ${method} ${route}`);
+  }, () => 10);
+  await expect(p.imageFromRuntime({ id: "suspended", ip: null, state: "stopped" }, "app")).rejects.toThrow("max 10");
+});
+
 test("an env of a repo with a base image boots from it, without cloud-init, on a disk at least as large", () => {
   const p = withKey(new GceProvider());
   const body: any = (p as any).instanceBody(spec, "n", "e2-standard-4", false, { name: "img", image: "global/images/img", diskGb: 80 });

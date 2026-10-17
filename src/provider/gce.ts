@@ -581,14 +581,16 @@ export class GceProvider extends SshVmProvider implements RuntimeProvider {
     }
   }
 
-  async imageFromRuntime(rt: Runtime, repo: string): Promise<string> {
+  async imageFromRuntime(rt: Runtime, repo: string, onRunning?: () => void): Promise<string> {
     let fresh = await this.describe(rt.id);
     if (fresh.state === "terminated") throw new RunoError(`Instance ${rt.id} no longer exists`);
     // the disk has to be quiet: a suspended VM still owns its memory state
     if (fresh.gceStatus === "SUSPENDED") {
-      await this.waitOp(await this.api("POST", `${this.inst(rt.id)}/resume`));
-      fresh = await this.waitForState(rt.id, "running", 5 * 60_000);
+      fresh = await this.resume(fresh);
     }
+    // No further starts occur during imaging; it must not hold admission
+    // through the image operation, which can take up to thirty minutes.
+    onRunning?.();
     if (fresh.state !== "stopped") {
       log.step("stopping the environment to image its disk…");
       await this.waitOp(await this.api("POST", `${this.inst(rt.id)}/stop`));

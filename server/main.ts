@@ -136,7 +136,7 @@ const RPC_ALLOWED = new Set([
   "imageFromRuntime",
 ]);
 
-const CAPACITY_RPC = new Set(["create", "resume", "poolScale", "prepareBootImage"]);
+const CAPACITY_RPC = new Set(["create", "resume", "poolScale", "prepareBootImage", "imageFromRuntime"]);
 let capacityTurn = Promise.resolve();
 
 async function handleRpc(who: Identity, body: any): Promise<Response> {
@@ -206,7 +206,8 @@ async function dispatchRpc(who: Identity, method: string, args: any[], releaseCa
     enforceCreate(pol, spec, { user, userRunningCount, runningTotal: up.size });
   }
 
-  if (method === "resume" && !isUp(args[0].state)) {
+  if ((method === "resume" && !isUp(args[0].state)) ||
+      (method === "imageFromRuntime" && args[0].gceStatus === "SUSPENDED")) {
     const pol = loadPolicies();
     if (pol.max_envs_per_user !== undefined || pol.max_running_total !== undefined) {
       const up = new Set((await provider.listManaged()).filter((m) => isUp(m.state)).map((m) => m.id));
@@ -224,6 +225,8 @@ async function dispatchRpc(who: Identity, method: string, args: any[], releaseCa
   // setup and image generation must not hold up other users' creates/resumes.
   const result = method === "prepareBootImage" && provider instanceof Ec2Provider
     ? await provider.prepareBootImage(args[0], releaseCapacity)
+    : method === "imageFromRuntime" && provider instanceof GceProvider
+    ? await provider.imageFromRuntime(args[0], args[1], releaseCapacity)
     : await (provider as any)[method](...args);
 
   // bookkeeping for the platform view
