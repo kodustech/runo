@@ -90,6 +90,8 @@ running before and after is counted as running throughout.
   running limit is the server's only fleet ceiling, including resumed machines,
   pool provisioning and image builds. Empty means unlimited. The server ignores
   `RUNO_MAX_INSTANCES`; that setting applies only to direct AWS CLI use.
+  Capacity-changing operations run one at a time through readiness and registry
+  updates, so simultaneous requests cannot spend the same quota slot.
 - **Prices** — the table above.
 - **People and service accounts** — promote/demote, disable; create token-only
   identities for CI and agents. A GitHub login can never take over a service

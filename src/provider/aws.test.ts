@@ -82,6 +82,21 @@ test("resume respects the running limit before starting a stopped machine", asyn
   expect(await p.resume({ id: "i-running", ip: "192.0.2.1", state: "running" })).toMatchObject({ state: "running" });
 });
 
+for (const state of ["running", "pending"] as const) {
+  test(`resume waits for a public IP when the instance is already ${state}`, async () => {
+    let describes = 0;
+    const p = providerWith(async (cmd) => {
+      if (!(cmd instanceof DescribeInstancesCommand)) throw new Error(`unexpected ${cmd.constructor.name}`);
+      return { Reservations: [{ Instances: [{
+        InstanceId: "i-starting", State: { Name: "running" },
+        ...(++describes > 1 ? { PublicIpAddress: "192.0.2.1" } : {}),
+      }] }] };
+    });
+    expect(await p.resume({ id: "i-starting", ip: null, state })).toMatchObject({ state: "running", ip: "192.0.2.1" });
+    expect(describes).toBe(2);
+  });
+}
+
 test("an instance seen once and then gone is a real termination", async () => {
   let describes = 0;
   const p = providerWith(async (cmd) => {

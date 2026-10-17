@@ -130,12 +130,32 @@ const RPC_ALLOWED = new Set([
   "removeBootImage",
 ]);
 
+const CAPACITY_RPC = new Set(["create", "resume", "poolScale", "prepareBootImage"]);
+let capacityTurn = Promise.resolve();
+
 async function handleRpc(who: Identity, body: any): Promise<Response> {
-  const user = who.user;
   const { method, args = [] } = body;
   if (!RPC_ALLOWED.has(method)) return json({ error: { message: `unknown method: ${method}` } }, 400);
   if (who.via === "session" && !SESSION_RPC.has(method))
     throw new AccessDenied("This operation needs a CLI token, not a browser session");
+  if (!CAPACITY_RPC.has(method)) return dispatchRpc(who, method, args);
+
+  // This control plane is a single process. Hold admission until the cloud
+  // operation and registry update finish, so simultaneous creates/resumes
+  // cannot both spend the same owner/org slot. Failed operations release it too.
+  const previous = capacityTurn;
+  let release!: () => void;
+  capacityTurn = new Promise<void>((resolve) => { release = resolve; });
+  await previous;
+  try {
+    return await dispatchRpc(who, method, args);
+  } finally {
+    release();
+  }
+}
+
+async function dispatchRpc(who: Identity, method: string, args: any[]): Promise<Response> {
+  const user = who.user;
   const envsBefore = Object.values(loadEnvs());
   let target: ServerEnv | undefined;
   if (["waitReady", "status", "suspend", "resume", "destroy"].includes(method)) {

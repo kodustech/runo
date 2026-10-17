@@ -575,7 +575,7 @@ export class Ec2Provider implements RuntimeProvider {
   }
 
   async resume(rt: Runtime): Promise<Runtime> {
-    if (rt.state === "running") return rt;
+    if (rt.state === "running") return rt.ip ? rt : this.waitForState(rt.id, "running", 5 * 60_000, true);
     if (rt.state === "pending") return this.waitForState(rt.id, "running", 5 * 60_000, true);
     await this.guardrail();
     try {

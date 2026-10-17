@@ -24,6 +24,8 @@ async function withServer(run: (request: Call, port: string) => Promise<void>, m
         this.ensureSecurityGroup = async () => "sg-test";
         this.claimFromPool = async () => null;
         this.launchInstance = async (options) => {
+          await Bun.sleep(40);
+          if (options.tags.some((tag) => tag.Key === "runo:env" && tag.Value === "cloud-failure")) throw new Error("simulated cloud failure");
           const rt = { id: "i-new-" + (++nextId), ip: "192.0.2.11", state: "running", instanceType: options.instanceType };
           fleet.push(rt);
           return rt.id;
@@ -31,6 +33,7 @@ async function withServer(run: (request: Call, port: string) => Promise<void>, m
         this.waitForState = async (id) => fleet.find((rt) => rt.id === id);
         this.ec2 = { send: async (cmd) => {
           if (cmd.constructor.name !== "StartInstancesCommand") throw new Error("unexpected cloud command: " + cmd.constructor.name);
+          await Bun.sleep(40);
           fleet.find((rt) => rt.id === cmd.input.InstanceIds[0]).state = "running";
           return {};
         }};
@@ -207,4 +210,46 @@ test("resuming observes panel capacity for the machine's owner, including an adm
   await put({ max_running_total: 2 });
   expect((await request("/v1/rpc", "ci", { method: "resume", args: [rt] })).status).toBe(200);
   expect((await request("/v1/rpc", "ci", { method: "resume", args: [rt] })).status).toBe(200);
+}), 15000);
+
+for (const quota of ["owner", "organization"] as const) {
+  for (const methods of [["resume", "resume"], ["create", "resume"], ["create", "create"]] as const) {
+    test(`simultaneous ${methods.join("/")} cannot spend the same ${quota} slot`, () => withServer(async (request, port) => {
+      const create = (name: string) => request("/v1/rpc", "ci", { method: "create", args: [{
+        envName: name, slug: name, branch: name, repo: "app", instanceType: "t3.micro", diskGb: 20,
+      }] });
+      const second = await create("second");
+      expect(second.status).toBe(200);
+      const secondRt = (await second.json() as any).result;
+      for (const runtime of [rt, secondRt])
+        expect((await request("/v1/rpc", "ci", { method: "suspend", args: [runtime] })).status).toBe(200);
+      expect((await fetch(`http://localhost:${port}/v1/policies`, {
+        method: "PUT", headers: { authorization: "Bearer boss-token" },
+        body: JSON.stringify(quota === "owner" ? { max_envs_per_user: 1, max_running_total: 10 } : { max_envs_per_user: 10, max_running_total: 1 }),
+      })).status).toBe(200);
+
+      // The fake cloud delays both launches and starts before making them visible.
+      const responses = await Promise.all(methods.map((method, index) => method === "create"
+        ? create(`concurrent-${index}`)
+        : request("/v1/rpc", "boss", { method, args: [index === 0 ? rt : secondRt] })));
+      expect(responses.map((response) => response.status).sort()).toEqual([200, 400]);
+      const blocked = responses.find((response) => response.status === 400)!;
+      expect(await blocked.json()).toMatchObject({ error: { message: expect.stringContaining("limit 1") } });
+      const fleet = (await (await request("/v1/rpc", "ci", { method: "listManaged" })).json() as any).result;
+      expect(fleet.filter((runtime: any) => runtime.state === "running")).toHaveLength(1);
+    }), 15000);
+  }
+}
+
+test("a failed cloud launch releases capacity for the next request", () => withServer(async (request, port) => {
+  expect((await request("/v1/rpc", "ci", { method: "suspend", args: [rt] })).status).toBe(200);
+  expect((await fetch(`http://localhost:${port}/v1/policies`, {
+    method: "PUT", headers: { authorization: "Bearer boss-token" },
+    body: JSON.stringify({ max_envs_per_user: 1, max_running_total: 1 }),
+  })).status).toBe(200);
+  const create = (name: string) => request("/v1/rpc", "ci", { method: "create", args: [{
+    envName: name, slug: name, branch: name, repo: "app", instanceType: "t3.micro", diskGb: 20,
+  }] });
+  expect((await create("cloud-failure")).status).toBe(500);
+  expect((await create("after-failure")).status).toBe(200);
 }), 15000);
