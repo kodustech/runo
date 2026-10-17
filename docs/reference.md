@@ -7,6 +7,7 @@ Detailed configuration for Runo. Start with the [quickstart](quickstart.md) for 
 | Var | Default | Effect |
 | --- | --- | --- |
 | `RUNO_HOME` | `~/.runo` | state root (registry, worktrees, SSH keys). Parallel installs MUST use distinct RUNO_HOMEs |
+| `RUNO_PROVIDER` | `aws` | cloud for direct mode and for runo-server: `aws` or `gce` (alpha, see "Google Compute Engine") |
 | `RUNO_AWS_REGION` | `sa-east-1` | EC2 region (compare current AWS prices for your region) |
 | `RUNO_DEBUG` | : | `1` prints stack traces |
 | `RUNO_RECIPE` | `.kodus/workspace.yaml` | which recipe to read (same as `--recipe`) : one repo can describe a dev box AND a PR preview |
@@ -291,6 +292,56 @@ runo up --here
 - **Local registry**: `$RUNO_HOME/envs.json`.
 - **Cost guardrails**: max 3 RUNNING instances *per install* (scoped by the
   `runo:home-hash` tag); everything tagged `runo:managed=true`.
+
+## Google Compute Engine (`RUNO_PROVIDER=gce`)
+
+> **Alpha.** Covered by unit tests against a mocked Compute Engine API; it has
+> not yet run end to end on a real project. Expect rough edges, use a project
+> of its own, and report what breaks.
+
+The same recipes run on Compute Engine. Set `RUNO_PROVIDER=gce` where VMs are
+created: the control plane (developers, CI and agents keep talking to it with
+a token, unchanged) or a laptop in direct mode.
+
+| Var | Default | Effect |
+| --- | --- | --- |
+| `RUNO_GCP_PROJECT` | (required) | project the VMs live in. Use a project of their own, not production's |
+| `RUNO_GCP_ZONE` | `us-central1-a` | zone of every env VM |
+| `RUNO_GCP_NETWORK` | `default` | VPC network |
+| `RUNO_GCP_SUBNET` | : | subnetwork, required on custom-mode networks |
+| `RUNO_GCP_IMAGE` | Ubuntu 24.04 LTS family | boot image |
+| `RUNO_GCP_DISK_TYPE` | `pd-balanced` | boot disk type |
+| `RUNO_EXPECTED_GCP_IDENTITY` | : | refuse to run as any other account / service account |
+
+- **Credentials**: on a Compute Engine VM, the attached service account via
+  the metadata server; elsewhere `gcloud auth print-access-token`. It needs
+  `roles/compute.instanceAdmin.v1` and `roles/compute.securityAdmin` (one
+  firewall rule, `runo-<hash6>`, opens 22 and the public ports to the env VMs'
+  network tag).
+- **Env VMs have no service account**: nothing running on them holds Google
+  Cloud credentials. Recipes that need cloud access must bring their own.
+- **Machine types**: a recipe may name a Compute Engine type
+  (`e2-standard-8`); EC2 sizes map to the E2 type with the same vCPU and
+  memory (`t3.xlarge` → `e2-standard-4`), so one recipe serves both clouds.
+  Policies on the server match the recipe's value as written.
+- **Identity**: labels `runo_managed`, `runo_home_hash` and `runo_env`, plus
+  instance metadata `runo-repo`, `runo-branch`, `runo-profile` (branch names do
+  not fit label values).
+- **Suspend** uses Compute Engine suspend (RAM → disk) and falls back to stop;
+  spot VMs stop. Idle auto-suspend powers off from inside, which Compute
+  Engine reports as `TERMINATED`, its word for stopped.
+- **Base image per repo** (`runo bake --from-env`): instead of a bake VM, the
+  image is taken from an env that already ran the recipe and is warm. Before
+  imaging, runo removes the recipe's `files.copy`, the agent credentials and the
+  logs from the disk. Every new env of that repo boots from the newest image
+  (family `runo-<hash6>-<repo>`, the previous one is kept for rollback), skips
+  cloud-init, and its upload **syncs** instead of replacing the tree: files the
+  commit removed go, files it changed are copied by content, and everything git
+  ignores (dependencies, build output, caches) stays. Only changed files get a
+  new mtime, so incremental builds redo only what the commit touched. The env
+  it came from is left stopped; `runo up` brings it back. Through the control
+  plane, baking is admin-only. `runo bake --rm` deletes this install's images.
+- **Not yet**: `runo pool`.
 
 ## Teams: control plane. no AWS credentials on laptops
 

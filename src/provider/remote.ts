@@ -123,6 +123,9 @@ export class RemoteProvider implements RuntimeProvider {
   removeBootImage(): Promise<void> {
     return this.rpc("removeBootImage");
   }
+  imageFromRuntime(rt: Runtime, repo: string): Promise<string> {
+    return this.rpc("imageFromRuntime", rt, repo);
+  }
   async environments(): Promise<SharedEnvironment[]> {
     const res = await fetch(`${this.base}/v1/envs`, { headers: this.headers() });
     const data = await res.json() as any;

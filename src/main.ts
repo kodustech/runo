@@ -4,7 +4,7 @@ import { AGENT_ENV_PATH, RUNO_HOME, REMOTE_RUNO_DIR, TMP_DIR, envNameFor, profil
 import { requireAgentEnv, resolveAgentEnv } from "./agentAuth";
 import { RunoError } from "./errors";
 import { fmtDuration, log } from "./log";
-import { getProvider } from "./provider";
+import { getProvider, defaultProviderName } from "./provider";
 import { RemoteProvider } from "./provider/remote";
 import type { Runtime } from "./provider/types";
 import { registry, urlsFor, type EnvRecord } from "./registry";
@@ -69,6 +69,10 @@ Usage: runo <command> [args]
   suspend | resume            stop/start the instance (stopped costs no compute)
   bake [--rm]                 bakes a base image with provisioning done —
                               subsequent runo up boot in ~1-2min (--rm removes)
+  bake --from-env             the repo's base image from this env's disk, warm
+                              (deps, builds, caches); new envs of the repo boot
+                              from it and only sync what changed. Leaves the env
+                              stopped
   pool [n]                    warm pool: n provisioned, STOPPED instances
                               (EBS-only cost); runo new claims from it (~40s).
                               No argument shows status; 0 drains the pool
@@ -86,6 +90,7 @@ interface Flags {
   restart: boolean;
   rm: boolean;
   warm: boolean;
+  fromEnv: boolean;
   here: boolean;
   validate: boolean;
   destroyAfter: boolean;
@@ -102,6 +107,7 @@ function parseFlags(args: string[]): Flags {
     restart: false,
     rm: false,
     warm: false,
+    fromEnv: false,
     here: false,
     validate: false,
     destroyAfter: false,
@@ -136,6 +142,7 @@ function parseFlags(args: string[]): Flags {
     else if (a === "--restart") f.restart = true;
     else if (a === "--rm") f.rm = true;
     else if (a === "--warm") f.warm = true;
+    else if (a === "--from-env") f.fromEnv = true;
     else if (a === "--here") f.here = true;
     else if (a === "--validate") f.validate = true;
     else if (a === "--destroy") f.destroyAfter = true;
@@ -230,10 +237,10 @@ async function cmdSetup(): Promise<void> {
   if (Bun.which("gh")) log.ok("gh found (runo ship can open PRs)");
   else log.warn("gh not found — runo ship will push but skip PR creation (brew install gh)");
 
-  // 2. cloud access (control plane or direct AWS)
+  // 2. cloud access (control plane or direct AWS / Compute Engine)
   if (process.env.RUNO_SERVER) {
     try {
-      await getProvider("aws").preflight();
+      await getProvider().preflight();
       log.ok(`control plane reachable (${process.env.RUNO_SERVER})`);
     } catch (e: any) {
       log.error(e.message);
@@ -242,8 +249,8 @@ async function cmdSetup(): Promise<void> {
     }
   } else {
     try {
-      await getProvider("aws").preflight();
-      log.ok("AWS credentials valid (direct mode)");
+      await getProvider().preflight();
+      log.ok(`${getProvider().name === "gce" ? "Google Cloud" : "AWS"} credentials valid (direct mode)`);
     } catch (e: any) {
       log.error(e.message);
       if (e.hint) log.info(`→ ${e.hint}`);
@@ -301,7 +308,7 @@ async function cmdSetup(): Promise<void> {
 
   // 5. speed-ups (direct mode)
   if (!process.env.RUNO_SERVER && problems === 0) {
-    const provider = getProvider("aws");
+    const provider = getProvider();
     const pool = await provider.poolStatus().catch(() => []);
     if (pool.length > 0) log.ok(`warm pool: ${pool.length} instance(s) ready`);
     else if (
@@ -683,7 +690,7 @@ async function cmdLs(): Promise<void> {
     log.info("no environments — create one with `runo new <name>`");
     return;
   }
-  const provider = getProvider("aws");
+  const provider = getProvider();
   const rows: string[][] = [["ENV", "BRANCH", "PROFILE", "STATE", "URL", "UPTIME", "INSTANCE"]];
   const statuses = await Promise.all(
     envs.map(async (e) => {
@@ -731,8 +738,39 @@ async function cmdResume(flags: Flags): Promise<void> {
   await resumeEnv(contextFromEnv(env));
 }
 
+/**
+ * The repo's base image from an env that already ran the recipe: its disk
+ * carries dependencies, builds and caches, so a new env of the repo only
+ * syncs what its commit changed (uploadCode's warm path). What belongs to
+ * this env, not to the repo, leaves the disk first.
+ */
+async function cmdBakeFromEnv(flags: Flags): Promise<void> {
+  const env = resolveEnv({ branch: flags.branch, profile: flags.profile });
+  const provider = getProvider(env.provider);
+  if (!provider.imageFromRuntime)
+    throw new RunoError(`The ${provider.name} provider cannot bake from an environment`, "Use runo bake --warm");
+  const ctx = contextFromEnv(env);
+  const rt = await runningRuntime(env);
+  const remoteDir = remoteRepoDir(env.repo);
+  log.step("removing what belongs to this env, not to the image (files.copy, agent credentials, logs)…");
+  const scrub = [
+    ...ctx.recipe.filesCopy.map((rel) => `rm -f ${shq(`${remoteDir}/${rel}`)}`),
+    `rm -f ${REMOTE_RUNO_DIR}/agent.env`,
+    `rm -rf ${REMOTE_RUNO_DIR}/evidence ${REMOTE_RUNO_DIR}/logs/*`,
+    // uploadCode syncs into a tree marked warm instead of replacing it
+    `echo ${shq(env.repo)} > ${REMOTE_RUNO_DIR}/warm-base`,
+  ].join(" && ");
+  const r = await provider.exec(rt, scrub);
+  if (r.exitCode !== 0) throw new RunoError(`Could not prepare the disk: ${r.stderr.trim()}`);
+  const image = await provider.imageFromRuntime(rt, env.repo);
+  registry.upsert({ ...env, state: "stopped", updatedAt: new Date().toISOString() });
+  log.ok(`base image for ${env.repo}: ${image} — new envs of the repo boot from it`);
+  log.info(`${env.name} is stopped and lost its files.copy: runo up --branch ${env.branch} brings it back`);
+}
+
 async function cmdBake(flags: Flags): Promise<void> {
-  const provider = getProvider("aws");
+  if (flags.fromEnv) return await cmdBakeFromEnv(flags);
+  const provider = getProvider();
   await provider.preflight();
   if (flags.rm) {
     await provider.removeBootImage();
@@ -792,7 +830,7 @@ async function cmdBake(flags: Flags): Promise<void> {
 }
 
 async function cmdPool(flags: Flags): Promise<void> {
-  const provider = getProvider("aws");
+  const provider = getProvider();
   await provider.preflight();
   const arg = flags.positional[0];
   if (arg === undefined) {
@@ -852,7 +890,7 @@ async function cmdDestroy(flags: Flags): Promise<void> {
   if (flags.all) {
     const envs = registry.list();
     for (const env of envs) await destroyOne(env);
-    const provider = getProvider("aws");
+    const provider = getProvider();
     await provider.preflight();
     const leftover = await provider.listManaged();
     for (const rt of leftover) {
@@ -897,7 +935,7 @@ async function resolveOrAdopt(branch: string, profile?: string): Promise<EnvReco
   } catch (notRegistered) {
     const repoPath = requireRepo();
     const repoName = path.basename(repoPath);
-    const provider = getProvider("aws");
+    const provider = getProvider();
     await provider.preflight();
     const rt = await provider.findByTags?.(repoName, branch, profile);
     if (!rt) return null;
@@ -910,7 +948,7 @@ async function resolveOrAdoptAll(branch: string): Promise<EnvRecord[]> {
   const repoPath = requireRepo();
   const repoName = path.basename(repoPath);
   const local = registry.listByRepoBranch(repoPath, branch);
-  const provider = getProvider("aws");
+  const provider = getProvider();
   await provider.preflight();
   const remote = (await provider.listByBranch?.(repoName, branch)) ?? [];
   const known = new Set(local.map((e) => (e.runtime as any)?.id).filter(Boolean));
@@ -933,7 +971,7 @@ function adoptedRecord(repoPath: string, branch: string, rt: Runtime, profile?: 
       profile,
       worktree: repoPath,
       externalWorktree: true, // never touch a directory this machine did not create
-      provider: "aws",
+      provider: defaultProviderName(),
       runtime: rt as unknown as Record<string, unknown>,
       state: rt.state === "running" ? "running" : "stopped",
       publicServices: [],
