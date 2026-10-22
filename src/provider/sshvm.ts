@@ -206,7 +206,7 @@ export abstract class SshVmProvider {
   /** Where port 22 is opened, for the hint when SSH never answers. */
   protected abstract readonly firewallHint: string;
 
-  async waitReady(rt: Runtime, opts: { firstBoot?: boolean } = {}): Promise<void> {
+  async waitReady(rt: Runtime, opts?: { firstBoot?: boolean } | null): Promise<void> {
     const sshDeadline = Date.now() + 5 * 60_000;
     let up = false;
     while (Date.now() < sshDeadline) {
@@ -222,7 +222,7 @@ export abstract class SshVmProvider {
         `SSH did not respond at ${rt.ip} after 5min`,
         `Check the ${this.firewallHint} (port 22) and the instance state with \`runo ls\``,
       );
-    if (opts.firstBoot)
+    if (opts?.firstBoot)
       log.step("waiting for provisioning (cloud-init) — first boot takes a few minutes…");
     const ci = await this.exec(rt, "cloud-init status --wait || true; cloud-init status", {
       timeoutMs: 20 * 60_000,
