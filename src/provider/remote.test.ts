@@ -100,3 +100,18 @@ test("two profiles of one branch are two environments on the control plane", asy
     expect(all.map((rt) => [rt.id, rt.profile])).toEqual([["i-cloud", "cloud"], ["i-self", "self-hosted"]]);
   } finally { server.stop(true); }
 });
+
+test("waitReady without options sends an object, never null", async () => {
+  const requests: any[] = [];
+  const server = Bun.serve({ port: 0, async fetch(req) {
+    requests.push(await req.json());
+    return Response.json({ result: null });
+  }});
+  try {
+    const provider = new RemoteProvider(server.url.toString(), "token");
+    const rt = { id: "i-preview", ip: "192.0.2.10", state: "running" } as any;
+    await provider.waitReady(rt);
+    await provider.waitReady(rt, { firstBoot: true });
+    expect(requests.map((r) => r.args[1])).toEqual([{}, { firstBoot: true }]);
+  } finally { server.stop(true); }
+});

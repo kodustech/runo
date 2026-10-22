@@ -91,7 +91,9 @@ export class RemoteProvider implements RuntimeProvider {
     return this.rpc("create", spec);
   }
   waitReady(rt: Runtime, opts?: { firstBoot?: boolean }): Promise<void> {
-    return this.rpc("waitReady", rt, opts);
+    // JSON turns an absent opts into null, which a default parameter does
+    // not replace: the server would read null.firstBoot.
+    return this.rpc("waitReady", rt, opts ?? {});
   }
   status(rt: Runtime): Promise<Runtime> {
     return this.rpc("status", rt);
