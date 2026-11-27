@@ -25,12 +25,13 @@ import { log } from "../src/log";
 import { Ec2Provider } from "../src/provider/aws";
 import { GceProvider } from "../src/provider/gce";
 import { defaultProviderName } from "../src/provider";
-import type { CreateSpec, ExecOpts, Runtime } from "../src/provider/types";
+import type { CreateSpec, ExecOpts, Runtime, RuntimeProvider } from "../src/provider/types";
 import { DEFAULT_PUBLIC_PORTS, enforceCreate, enforceRunningLimits, loadPolicies } from "./policies";
 import { AccessDenied, canAccess, requireAccess } from "./access";
 import { Auth, authConfigFromEnv, ReauthRequired, readCookie, safeEqual, sessionMayCall, SESSION_RPC, Throttle, type Identity } from "./auth";
 import { handlePanelApi } from "./panelApi";
 import { Store } from "./store";
+import { sweepStopped } from "./retire";
 import { isUp, sampleFleet, vanishedEnvs } from "./usage";
 import { randomBytes } from "node:crypto";
 
@@ -39,7 +40,7 @@ const providerOptions = {
   runningInstanceLimit: () => loadPolicies().max_running_total,
 };
 // RUNO_PROVIDER picks the cloud this control plane manages (aws | gce)
-const provider = defaultProviderName() === "gce" ? new GceProvider(providerOptions) : new Ec2Provider(providerOptions);
+const provider: Ec2Provider | GceProvider = defaultProviderName() === "gce" ? new GceProvider(providerOptions) : new Ec2Provider(providerOptions);
 const REGION = provider instanceof GceProvider ? provider.region : AWS_REGION;
 
 // ---------- auth ----------
@@ -737,6 +738,56 @@ async function sweepTtl(): Promise<void> {
 }
 setInterval(sweepTtl, 10 * 60_000);
 void sweepTtl();
+
+// ---------- disk sweeper (gp3 baseline + policy retire_stopped_after_days) ----------
+
+let sweepingDisks = false;
+async function sweepDisks(): Promise<void> {
+  if (sweepingDisks) return;
+  sweepingDisks = true;
+  // the optional RuntimeProvider methods: Compute Engine has none of them yet
+  const disks: RuntimeProvider = provider;
+  try {
+    // volumes from before runo provisioned the gp3 baseline, running ones included
+    await disks.settleDiskPerformance?.();
+    let pol;
+    try {
+      pol = loadPolicies();
+    } catch {
+      return;
+    }
+    if (!pol.retire_stopped_after_days) return;
+    const { snapshotForRetire, retireSnapshotsState, clearRetireMark } = disks;
+    if (!snapshotForRetire || !retireSnapshotsState || !clearRetireMark) return; // this cloud cannot snapshot yet
+    await sweepStopped({
+      afterDays: pol.retire_stopped_after_days,
+      dryRun: Boolean(pol.retire_dry_run),
+      provider: {
+        listManaged: () => provider.listManaged(),
+        status: (rt) => provider.status(rt),
+        destroy: (rt) => provider.destroy(rt),
+        snapshotForRetire: snapshotForRetire.bind(provider),
+        retireSnapshotsState: retireSnapshotsState.bind(provider),
+        clearRetireMark: clearRetireMark.bind(provider),
+      },
+      store,
+      envs: Object.values(loadEnvs()),
+      dropEnv: (envName, instanceId) => {
+        const cur = loadEnvs();
+        if (cur[envName]?.instanceId !== instanceId) return;
+        delete cur[envName];
+        saveEnvs(cur);
+      },
+      log,
+    });
+  } catch (e: any) {
+    log.warn(`disk sweep failed: ${e?.message ?? e}`);
+  } finally {
+    sweepingDisks = false;
+  }
+}
+setInterval(sweepDisks, 10 * 60_000);
+void sweepDisks();
 
 setInterval(sampleNow, 60_000);
 setInterval(() => {

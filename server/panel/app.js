@@ -292,7 +292,9 @@ const views = {
         <label>Max machines running at once, whole org<input name="max_running_total" type="number" min="1" value="${val(policies.max_running_total)}" /></label>
         <label>Ports anyone may open to the world (comma separated; empty = 80, 443; other ports need an admin)<input name="allowed_public_ports" value="${val(policies.allowed_public_ports?.join(", "))}" /></label>
         <label>Destroy environments older than, days (fractions allowed)<input name="env_ttl_days" type="number" min="0" step="any" value="${val(policies.env_ttl_days)}" /></label>
-        <div class="row"><button type="submit" class="primary">save policies</button><span class="dim small">Empty = unlimited. Applies to the next create; the TTL sweeper runs every 10 minutes.</span></div>
+        <label>Retire environments stopped for, days: snapshot the disk, then terminate (fractions allowed)<input name="retire_stopped_after_days" type="number" min="0" step="any" value="${val(policies.retire_stopped_after_days)}" /></label>
+        <label class="row"><input name="retire_dry_run" type="checkbox" ${policies.retire_dry_run ? "checked" : ""} /> Retire dry run: only log what would be retired</label>
+        <div class="row"><button type="submit" class="primary">save policies</button><span class="dim small">Empty = unlimited. Applies to the next create; the TTL and retire sweepers run every 10 minutes.</span></div>
       </form></div>`;
 
     const p = pricing.pricing;
@@ -370,6 +372,7 @@ const forms = {
     allowed_instance_types: String(f.get("allowed_instance_types")).split(",").map((s) => s.trim()).filter(Boolean),
     max_disk_gb: numberOrNull(f.get("max_disk_gb")), max_envs_per_user: numberOrNull(f.get("max_envs_per_user")),
     max_running_total: numberOrNull(f.get("max_running_total")), env_ttl_days: numberOrNull(f.get("env_ttl_days")),
+    retire_stopped_after_days: numberOrNull(f.get("retire_stopped_after_days")), retire_dry_run: f.get("retire_dry_run") === "on",
     allowed_public_ports: String(f.get("allowed_public_ports")).trim() ? String(f.get("allowed_public_ports")).split(",").map((s) => Number(s.trim())) : null,
   } }),
   pricing: (f) => api("/v1/pricing", { method: "PUT", body: {

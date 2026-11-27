@@ -24,6 +24,8 @@ import {
   ModifyInstanceAttributeCommand,
   DescribeVolumesCommand,
   ModifyVolumeCommand,
+  CreateSnapshotCommand,
+  DescribeSnapshotsCommand,
   CancelSpotInstanceRequestsCommand,
   type Instance,
   type Tag,
@@ -39,6 +41,18 @@ import type { CreateSpec, Runtime, RuntimeProvider, RuntimeState } from "./types
 
 const AMI_SSM_PARAM =
   "/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id";
+
+/** What every gp3 volume includes for free; runo provisions exactly this. */
+export const GP3_BASELINE = { iops: 3000, throughputMBps: 125 } as const;
+
+/** Instance tags that carry a retire in progress from one server sweep to the next. */
+export const RETIRE_SNAPSHOTS_TAG = "runo:retire-snapshots";
+export const RETIRE_AT_TAG = "runo:retire-at";
+
+/** A gp3 volume provisioned above the baseline, which AWS bills every month. */
+export function aboveGp3Baseline(v: { VolumeType?: string; Iops?: number; Throughput?: number }): boolean {
+  return v.VolumeType === "gp3" && ((v.Iops ?? 0) > GP3_BASELINE.iops || (v.Throughput ?? 0) > GP3_BASELINE.throughputMBps);
+}
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -342,10 +356,11 @@ export class Ec2Provider extends SshVmProvider implements RuntimeProvider {
           Ebs: {
             VolumeSize: opts.diskGb,
             VolumeType: "gp3" as const,
-            // above the free gp3 baseline (3000/125): docker builds/pulls are
-            // IO-bound and this costs ~US$0.01/h prorated
-            Iops: 4000,
-            Throughput: 300,
+            // the gp3 baseline, free with the volume. Above it AWS bills IOPS
+            // and throughput per volume-month, stopped or not (4000/300 cost
+            // ~US$12 a month per env, mostly on envs nobody was using)
+            Iops: GP3_BASELINE.iops,
+            Throughput: GP3_BASELINE.throughputMBps,
             DeleteOnTermination: true,
             // hibernation requires an encrypted root (default aws/ebs key)
             ...(mode === "hibernation" ? { Encrypted: true } : {}),
@@ -462,6 +477,8 @@ export class Ec2Provider extends SshVmProvider implements RuntimeProvider {
     if (!i) return { id, ip: null, state: "terminated" };
     const nameTag = i.Tags?.find((t) => t.Key === "Name")?.Value;
     const profileTag = i.Tags?.find((t) => t.Key === "runo:profile")?.Value;
+    const retireSnapshots = i.Tags?.find((t) => t.Key === RETIRE_SNAPSHOTS_TAG)?.Value;
+    const retireAt = i.Tags?.find((t) => t.Key === RETIRE_AT_TAG)?.Value;
     return {
       id,
       ip: i.PublicIpAddress ?? null,
@@ -472,6 +489,8 @@ export class Ec2Provider extends SshVmProvider implements RuntimeProvider {
       lifecycle: i.InstanceLifecycle, // "spot" | undefined (on-demand)
       spotRequestId: i.SpotInstanceRequestId,
       ...(profileTag ? { profile: profileTag } : {}),
+      ...(retireSnapshots ? { retireSnapshots: retireSnapshots.split(",").filter(Boolean) } : {}),
+      ...(retireAt ? { retireAt } : {}),
     };
   }
 
@@ -550,6 +569,7 @@ export class Ec2Provider extends SshVmProvider implements RuntimeProvider {
     if (rt.state === "running") return rt.ip ? rt : this.waitForState(rt.id, "running", 5 * 60_000, true);
     if (rt.state === "pending") return this.waitForState(rt.id, "running", 5 * 60_000, true);
     await this.guardrail();
+    await this.settleDiskPerformance(rt.id);
     try {
       await this.ec2.send(new StartInstancesCommand({ InstanceIds: [rt.id] }));
     } catch (e: any) {
@@ -582,6 +602,110 @@ export class Ec2Provider extends SshVmProvider implements RuntimeProvider {
       throw e;
     }
     await this.waitForState(rt.id, "terminated", 8 * 60_000);
+  }
+
+  // ---------- disks ----------
+
+  /**
+   * Volumes created while runo provisioned 4000 IOPS / 300 MB/s keep that
+   * performance, and AWS bills it every month, stopped or not. Brings this
+   * install's volumes (or one instance's) down to the free gp3 baseline and
+   * returns how many it changed. Never blocks the caller: a gp3 volume
+   * accepts one change every 6 hours, and an identity without
+   * ec2:ModifyVolume keeps paying until its policy grants it.
+   */
+  async settleDiskPerformance(instanceId?: string): Promise<number> {
+    let volumes;
+    try {
+      const res = await this.ec2.send(
+        new DescribeVolumesCommand({
+          Filters: instanceId
+            ? [{ Name: "attachment.instance-id", Values: [instanceId] }]
+            : [
+                { Name: "tag:runo:managed", Values: ["true"] },
+                { Name: "tag:runo:home-hash", Values: [HASH6] },
+              ],
+        }),
+      );
+      volumes = res.Volumes ?? [];
+    } catch (e: any) {
+      log.dim(`could not list disks to move them to the gp3 baseline (${errCode(e) || e?.message})`);
+      return 0;
+    }
+    let changed = 0;
+    for (const v of volumes) {
+      if (!v.VolumeId || !aboveGp3Baseline(v)) continue;
+      try {
+        await this.ec2.send(
+          new ModifyVolumeCommand({ VolumeId: v.VolumeId, Iops: GP3_BASELINE.iops, Throughput: GP3_BASELINE.throughputMBps }),
+        );
+        changed++;
+        log.dim(`disk ${v.VolumeId}: ${v.Iops} IOPS / ${v.Throughput} MB/s → gp3 baseline (${GP3_BASELINE.iops} / ${GP3_BASELINE.throughputMBps})`);
+      } catch (e: any) {
+        log.dim(`disk ${v.VolumeId} keeps ${v.Iops} IOPS / ${v.Throughput} MB/s for now (${errCode(e) || e?.message})`);
+      }
+    }
+    return changed;
+  }
+
+  // ---------- retire (server: long-stopped envs → snapshot, then terminate) ----------
+
+  /**
+   * Snapshots every disk of a stopped env and marks the instance with the
+   * snapshot ids, so the next sweep (or the next server) knows what to wait
+   * for. The snapshots carry the env's own tags plus `tags`, which is how an
+   * admin finds them to restore.
+   */
+  async snapshotForRetire(rt: Runtime, tags: Tag[]): Promise<string[]> {
+    const inst = (await this.ec2.send(new DescribeInstancesCommand({ InstanceIds: [rt.id] })))
+      .Reservations?.[0]?.Instances?.[0];
+    const envTags = (inst?.Tags ?? []).filter(
+      (t) => t.Key && (t.Key === "Name" || t.Key.startsWith("runo:")) && t.Key !== RETIRE_SNAPSHOTS_TAG && t.Key !== RETIRE_AT_TAG,
+    );
+    const vols = await this.ec2.send(
+      new DescribeVolumesCommand({ Filters: [{ Name: "attachment.instance-id", Values: [rt.id] }] }),
+    );
+    const ids: string[] = [];
+    for (const v of vols.Volumes ?? []) {
+      if (!v.VolumeId) continue;
+      const snap = await this.ec2.send(
+        new CreateSnapshotCommand({
+          VolumeId: v.VolumeId,
+          Description: `runo retire of ${rt.name ?? rt.id} (${rt.id})`,
+          TagSpecifications: [{ ResourceType: "snapshot", Tags: [...envTags, ...tags] }],
+        }),
+      );
+      if (snap.SnapshotId) ids.push(snap.SnapshotId);
+    }
+    if (!ids.length) throw new RunoError(`Instance ${rt.id} has no disk to snapshot`);
+    await this.ec2.send(
+      new CreateTagsCommand({
+        Resources: [rt.id],
+        Tags: [
+          { Key: RETIRE_SNAPSHOTS_TAG, Value: ids.join(",") },
+          { Key: RETIRE_AT_TAG, Value: new Date().toISOString() },
+        ],
+      }),
+    );
+    return ids;
+  }
+
+  async retireSnapshotsState(ids: string[]): Promise<"completed" | "pending" | "failed"> {
+    try {
+      const res = await this.ec2.send(new DescribeSnapshotsCommand({ SnapshotIds: ids }));
+      const snaps = res.Snapshots ?? [];
+      if (snaps.length < ids.length || snaps.some((s) => s.State === "error")) return "failed";
+      return snaps.every((s) => s.State === "completed") ? "completed" : "pending";
+    } catch (e: any) {
+      if (errCode(e) === "InvalidSnapshot.NotFound") return "failed";
+      throw e;
+    }
+  }
+
+  async clearRetireMark(rt: Runtime): Promise<void> {
+    await this.ec2.send(
+      new DeleteTagsCommand({ Resources: [rt.id], Tags: [{ Key: RETIRE_SNAPSHOTS_TAG }, { Key: RETIRE_AT_TAG }] }),
+    );
   }
 
   // ---------- warm pool ----------
@@ -631,9 +755,21 @@ export class Ec2Provider extends SshVmProvider implements RuntimeProvider {
       }),
     );
     const root = vols.Volumes?.[0];
-    if (root?.VolumeId && (root.Size ?? 0) < spec.diskGb) {
-      log.dim(`growing disk ${root.Size}GB → ${spec.diskGb}GB (cloud-init expands the fs on boot)`);
-      await this.ec2.send(new ModifyVolumeCommand({ VolumeId: root.VolumeId, Size: spec.diskGb }));
+    const grow = Boolean(root?.VolumeId) && (root!.Size ?? 0) < spec.diskGb;
+    // one modification for both: a gp3 volume accepts a single change every 6 hours
+    const settle = Boolean(root?.VolumeId) && aboveGp3Baseline(root!);
+    if (grow || settle) {
+      if (grow) log.dim(`growing disk ${root!.Size}GB → ${spec.diskGb}GB (cloud-init expands the fs on boot)`);
+      try {
+        await this.ec2.send(new ModifyVolumeCommand({
+          VolumeId: root!.VolumeId,
+          ...(grow ? { Size: spec.diskGb } : {}),
+          ...(settle ? { Iops: GP3_BASELINE.iops, Throughput: GP3_BASELINE.throughputMBps } : {}),
+        }));
+      } catch (e: any) {
+        if (grow) throw e; // the recipe needs the space; the baseline is only a saving
+        log.dim(`disk ${root!.VolumeId} keeps ${root!.Iops} IOPS / ${root!.Throughput} MB/s (${errCode(e) || e?.message})`);
+      }
     }
     await this.ec2.send(new StartInstancesCommand({ InstanceIds: [inst.id] }));
     return await this.waitForState(inst.id, "running", 5 * 60_000, true);
@@ -718,7 +854,7 @@ export class Ec2Provider extends SshVmProvider implements RuntimeProvider {
         BlockDeviceMappings: [
           {
             DeviceName: rootDevice,
-            Ebs: { VolumeSize: bakeDisk, VolumeType: "gp3", Iops: 4000, Throughput: 300, DeleteOnTermination: true },
+            Ebs: { VolumeSize: bakeDisk, VolumeType: "gp3", Iops: GP3_BASELINE.iops, Throughput: GP3_BASELINE.throughputMBps, DeleteOnTermination: true },
           },
         ],
         InstanceInitiatedShutdownBehavior: "stop",

@@ -93,6 +93,10 @@ running before and after is counted as running throughout.
   Capacity changes are admitted one at a time until cloud state and registry
   updates account for their quota slot. Image preparation releases admission
   once its temporary VM is running, before setup and image generation.
+  "Retire environments stopped for" snapshots the disks of envs stopped that
+  many days and terminates them; turn on its dry run first to see the list in
+  the server log. Every retire is in the audit trail (`retire-snapshot`, then
+  `retire`, actor `system`).
 - **Prices** — the table above.
 - **People and service accounts** — promote/demote, disable; create token-only
   identities for CI and agents. A GitHub login can never take over a service

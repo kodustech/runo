@@ -2,3 +2,5 @@ allowed_instance_types: [t3.medium, t3.large, t3.xlarge, t3a.medium, t3a.large, 
 max_disk_gb: 100
 max_envs_per_user: 5
 max_running_total: 5
+# Retiring stopped envs (retire_stopped_after_days) stays off until the team
+# agrees on the delay; see server/policies.example.yaml.

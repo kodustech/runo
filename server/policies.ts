@@ -25,6 +25,14 @@ export interface Policies {
   /** Auto-destroy environments older than this many days (fractions allowed). */
   env_ttl_days?: number;
   /**
+   * Retire environments stopped for this many days (fractions allowed): their
+   * disks are snapshotted, then the instance is terminated. A stopped env
+   * costs only its disk, but that is billed every month.
+   */
+  retire_stopped_after_days?: number;
+  /** Log what the retire sweeper would do, without snapshotting or terminating anything. */
+  retire_dry_run?: boolean;
+  /**
    * Ports any user may open to the world on the shared security group. Absent =
    * 80 and 443, what `expose.mode: https` needs — so CI does not have to be an
    * admin to publish a preview. Anything else takes an admin.
@@ -49,7 +57,10 @@ export function loadPolicies(): Policies {
 /** Validates a policy document coming from the panel; absent/null fields mean unlimited. */
 export function parsePolicies(input: any): Policies {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new RunoError("policies must be an object");
-  const known = ["allowed_instance_types", "max_disk_gb", "max_envs_per_user", "max_running_total", "env_ttl_days", "allowed_public_ports"];
+  const known = [
+    "allowed_instance_types", "max_disk_gb", "max_envs_per_user", "max_running_total", "env_ttl_days",
+    "allowed_public_ports", "retire_stopped_after_days", "retire_dry_run",
+  ];
   const unknown = Object.keys(input).filter((k) => !known.includes(k));
   if (unknown.length) throw new RunoError(`Unknown policy: ${unknown.join(", ")}`);
   const out: Policies = {};
@@ -75,6 +86,17 @@ export function parsePolicies(input: any): Policies {
   if (ttl !== undefined && ttl !== null) {
     if (typeof ttl !== "number" || !Number.isFinite(ttl) || ttl <= 0) throw new RunoError("env_ttl_days must be a positive number");
     out.env_ttl_days = ttl;
+  }
+  const retire = input.retire_stopped_after_days;
+  if (retire !== undefined && retire !== null) {
+    if (typeof retire !== "number" || !Number.isFinite(retire) || retire <= 0)
+      throw new RunoError("retire_stopped_after_days must be a positive number");
+    out.retire_stopped_after_days = retire;
+  }
+  const dry = input.retire_dry_run;
+  if (dry !== undefined && dry !== null) {
+    if (typeof dry !== "boolean") throw new RunoError("retire_dry_run must be true or false");
+    if (dry) out.retire_dry_run = true;
   }
   return out;
 }

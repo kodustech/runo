@@ -34,6 +34,9 @@ export interface Runtime {
   /** "spot" when the instance is spot (affects suspend/destroy). */
   lifecycle?: string;
   spotRequestId?: string;
+  /** Server retire in progress: the snapshots taken of this stopped env, and when. */
+  retireSnapshots?: string[];
+  retireAt?: string;
   [extra: string]: unknown;
 }
 
@@ -143,6 +146,17 @@ export interface RuntimeProvider {
    * `profile`, when it has one) — a teardown without --profile takes them all.
    */
   listByBranch?(repo: string, branch: string): Promise<Runtime[]>;
+
+  /**
+   * Moves runo's disks (or one instance's) to the cloud's free performance
+   * baseline; returns how many changed. Never throws.
+   */
+  settleDiskPerformance?(instanceId?: string): Promise<number>;
+
+  /** Server retire: snapshots a stopped env's disks and marks the instance with them. */
+  snapshotForRetire?(rt: Runtime, tags: { Key: string; Value: string }[]): Promise<string[]>;
+  retireSnapshotsState?(ids: string[]): Promise<"completed" | "pending" | "failed">;
+  clearRetireMark?(rt: Runtime): Promise<void>;
 
   /** All runo-managed instances still alive (guardrail + audit). */
   listManaged(): Promise<Runtime[]>;
