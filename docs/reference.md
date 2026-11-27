@@ -256,6 +256,11 @@ runo up --here
 - **Health checks from outside**: HTTP 200 on `health:` (or TCP) against the
   public IP. validates the security group and the service in one shot.
   Failure fails `runo up` with the service's log tail.
+- **Disks**: gp3 at the free baseline (3000 IOPS / 125 MB/s). Volumes created
+  when runo provisioned 4000/300 are moved to the baseline on their next
+  resume or pool claim, and the control plane moves the rest every 10 minutes
+  (`ec2:ModifyVolume`; a gp3 volume accepts one change every 6 hours, so a
+  refused change is retried later and never blocks the resume).
 - **Suspend/resume**: a stopped instance costs no compute (EBS only, cents/day).
   EBS survives stop/start. database data persists. **The public IP changes**
   on every resume; runo redetects and updates registry/URL.
@@ -414,8 +419,13 @@ runo new my-task        # same CLI, same flow. AWS stays server-side
   tunnel; headless usage (`runo agent claude -- -p …`) works everywhere.
 - **Org policies** (`$RUNO_HOME/policies.yaml` on the server, hot-reloaded :
   see `server/policies.example.yaml`): instance-type allowlist, max disk,
-  max envs per user, org-wide running ceiling, and an env TTL with automatic
-  destruction (sweeper at startup + every 10min). The recipe in each repo
+  max envs per user, org-wide running ceiling, an env TTL with automatic
+  destruction (sweeper at startup + every 10min), and `retire_stopped_after_days`:
+  an env stopped that long has its disks snapshotted (tagged
+  `cleanup=runo-retired-<date>`, `runo:retired-from=<instance>`, plus the env's
+  own tags) and is terminated once the snapshots complete, two sweeps apart.
+  `retire_dry_run: true` only logs the list. Restore is by hand from the
+  snapshot; `runo up` rebuilds a branch's env from the repo anyway. The recipe in each repo
   decides the machine for that workload; policies are the platform team's
   ceilings on what any recipe/user may ask for. Violations fail `runo new`
   instantly with an actionable message. before anything touches the cloud.

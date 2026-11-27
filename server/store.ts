@@ -185,6 +185,16 @@ export class Store {
     return res.changes > 0;
   }
 
+  /** The machine's most recent run, open or not; null when it never ran. */
+  lastRun(instanceId: string): Run | null {
+    return (this.db
+      .query(
+        `SELECT instance_id AS instanceId, started_at AS startedAt, ended_at AS endedAt FROM runs
+         WHERE instance_id = ? ORDER BY started_at DESC LIMIT 1`,
+      )
+      .get(instanceId) as Run | null) ?? null;
+  }
+
   runsBetween(from: number, to: number): Run[] {
     return this.db
       .query(

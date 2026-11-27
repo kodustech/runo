@@ -16,7 +16,11 @@ export interface Pricing {
   spot_factor: number;
   /** USD per GB-month of gp3, charged while the machine exists (stopped included). */
   ebs_gb_month: number;
-  /** USD per volume-month for the IOPS/throughput runo provisions above the gp3 baseline (4000/300). */
+  /**
+   * USD per volume-month for IOPS/throughput above the gp3 baseline. runo now
+   * provisions the baseline (3000/125) and moves older volumes to it, so 0;
+   * set it if your disks are provisioned above it.
+   */
   ebs_extra_month: number;
   /** USD per hour of public IPv4, charged while running. */
   ipv4_hourly: number;
@@ -67,8 +71,8 @@ export function defaultPricing(region: string): Pricing {
     instance_hourly: { ...(BY_REGION[region] ?? {}) },
     spot_factor: 1,
     ebs_gb_month: region === "sa-east-1" ? 0.152 : 0.08,
-    // (4000 - 3000) IOPS x $0.005 + (300 - 125) MB/s x $0.04
-    ebs_extra_month: 12,
+    // runo provisions the gp3 baseline (3000 IOPS / 125 MB/s), which is free
+    ebs_extra_month: 0,
     ipv4_hourly: 0.005,
   };
 }

@@ -21,6 +21,15 @@ max_running_total: 9
 # The sweeper runs at startup and every 10 minutes.
 env_ttl_days: 7
 
+# Retire environments stopped for this many days (1.5 = 36 hours without use;
+# fractions allowed): the sweeper snapshots their
+# disks (tagged cleanup=runo-retired-<date> and runo:retired-from=<instance>),
+# then terminates the instance once the snapshots complete. Restore is by hand
+# from the snapshot; `runo up` rebuilds a branch's env from the repo anyway.
+retire_stopped_after_days: 1.5
+# Only log what would be retired (start with this on to see the list):
+# retire_dry_run: true
+
 # Ports any user may open to the world (default: 80 and 443, what expose
 # mode https needs). Other ports take an admin. [] = admins only.
 # allowed_public_ports: [80, 443]
